@@ -1,0 +1,9 @@
+{
+  "ffbin": "C:/Program Files/FFMPG/ffmpeg-8.1-full_build/bin",
+  "root": "Y:/Shared Movies",
+  "behalten": true,
+  "subs": true,
+  "nfo": true,
+  "modus": "filme",
+  "embed_subs": true
+}
