@@ -1,6 +1,6 @@
 """
-dv_remux_gui.py  v5
-===================
+dv_remux_gui.py  v5.0.1
+=======================
 GUI-Tool: Dolby Vision MKV → MP4 Remux + SRT Untertitel-Extraktion
 Für Jellyfin / LG TV
 
@@ -9,6 +9,11 @@ Neu in v3:
     werden durch die tatsächlich extrahierten SRT-Dateien ersetzt
   • Backup der originalen NFO als movie.nfo.bak vor jeder Änderung
   • XML-Struktur, Kommentare und tinyMediaManager-Metadaten bleiben erhalten
+
+Neu in v5.0.1:
+  • TrueHD-Fallback: MKVs mit TrueHD-Atmos-Track (nicht MP4-kompatibel)
+    werden automatisch ohne den TrueHD-Stream wiederholt – der EAC3-Track
+    bleibt erhalten. Kein manuelles Eingreifen nötig.
 
 Voraussetzungen:
   - Python 3.8+  (tkinter ist im Lieferumfang von Python enthalten)
@@ -91,6 +96,28 @@ def finde_mkv(ordner: Path):
     """Erste .mkv-Datei im Ordner zurückgeben."""
     dateien = list(ordner.glob("*.mkv"))
     return dateien[0] if dateien else None
+
+def ermittle_audio_streams(ffprobe: Path, mkv_pfad: Path) -> list:
+    """Audio-Streams analysieren – gibt Liste mit index + codec_name zurück.
+    Wird für den TrueHD-Fallback in remux_zu_mp4 benötigt: TrueHD ist im
+    MP4-Container nicht erlaubt; mit den zurückgegebenen Indizes können
+    inkompatible Tracks gezielt ausgelassen werden.
+    """
+    befehl = [
+        str(ffprobe), "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-select_streams", "a", str(mkv_pfad)
+    ]
+    try:
+        erg = subprocess.run(befehl, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace",
+                             check=True, timeout=60)
+        daten = json.loads(erg.stdout)
+        return [
+            {"index": s.get("index", "?"), "codec": s.get("codec_name", "unbekannt")}
+            for s in daten.get("streams", [])
+        ]
+    except Exception:
+        return []
 
 def ermittle_untertitel_streams(ffprobe: Path, mkv_pfad: Path) -> list:
     """Alle Untertitel-Streams analysieren (braucht ffprobe)."""
@@ -446,9 +473,13 @@ def aktualisiere_nfo(
 def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
                  log_q: queue.Queue, task_q: queue.Queue,
                  simulation: bool, log_zeilen: list,
-                 stopp_event=None, text_sub_indices=None) -> bool:
+                 stopp_event=None, text_sub_indices=None,
+                 ffprobe_pfad: Path = None,
+                 audio_indices: list = None) -> bool:
     """Remux MKV -> MP4 ohne Re-Encoding.
-    text_sub_indices: Liste von Stream-Indizes für Text-Untertitel → werden als mov_text eingebettet.
+    text_sub_indices: Stream-Indizes für Text-Untertitel → mov_text einbetten.
+    audio_indices: Explizite Audio-Stream-Indizes (None = alle via -map 0:a).
+    ffprobe_pfad: Wird für TrueHD-Retry benötigt.
     """
     if simulation:
         import time
@@ -464,11 +495,18 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
             time.sleep(0.04)
         return True
 
+    # Audio-Maps aufbauen: explizite Indizes (TrueHD-Retry) oder alle Streams
+    if audio_indices is not None:
+        audio_maps = []
+        for idx in audio_indices:
+            audio_maps += ["-map", f"0:{idx}"]
+    else:
+        audio_maps = ["-map", "0:a"]
+
     # Kommando aufbauen – 0:v:0 = nur Haupt-Videostream (kein MJPEG-Cover)
     if text_sub_indices:
         # Video + Audio + ausgewählte Text-Untertitel (→ mov_text)
-        befehl = [str(ffmpeg), "-i", str(mkv_pfad),
-                  "-map", "0:v:0", "-map", "0:a"]
+        befehl = [str(ffmpeg), "-i", str(mkv_pfad), "-map", "0:v:0"] + audio_maps
         for idx in text_sub_indices:
             befehl += ["-map", f"0:{idx}"]
         befehl += ["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
@@ -476,10 +514,10 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
                    "-movflags", "+faststart", "-y", str(mp4_pfad)]
     else:
         # Nur Haupt-Video + Audio mappen
-        befehl = [str(ffmpeg), "-i", str(mkv_pfad),
-                  "-map", "0:v:0", "-map", "0:a", "-c", "copy",
-                  "-strict", "unofficial", "-tag:v", "hvc1",
-                  "-movflags", "+faststart", "-y", str(mp4_pfad)]
+        befehl = ([str(ffmpeg), "-i", str(mkv_pfad), "-map", "0:v:0"]
+                  + audio_maps
+                  + ["-c", "copy", "-strict", "unofficial", "-tag:v", "hvc1",
+                     "-movflags", "+faststart", "-y", str(mp4_pfad)])
 
     msg = f"  Remux: {mkv_pfad.name} -> {mp4_pfad.name}"
     log_q.put(("INFO", f"  ▶  Remux: {mkv_pfad.name} → {mp4_pfad.name}"))
@@ -546,7 +584,31 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
                 return remux_zu_mp4(ffmpeg, mkv_pfad, mp4_pfad, log_q, task_q,
                                     simulation, log_zeilen,
                                     stopp_event=stopp_event,
-                                    text_sub_indices=None)
+                                    text_sub_indices=None,
+                                    ffprobe_pfad=ffprobe_pfad,
+                                    audio_indices=audio_indices)
+
+            # TrueHD ist im MP4-Container experimentell und von LG TV / Jellyfin
+            # nicht unterstützt. Bei entsprechendem ffmpeg-Fehler: Audio-Streams
+            # per ffprobe ermitteln, TrueHD-Tracks herausfiltern und neu versuchen.
+            truehd_fehler = any("truehd" in z.lower() for z in stderr_zeilen)
+            if truehd_fehler and ffprobe_pfad and audio_indices is None:
+                alle_audio = ermittle_audio_streams(ffprobe_pfad, mkv_pfad)
+                kompatibel = [s["index"] for s in alle_audio if s["codec"] != "truehd"]
+                if kompatibel:
+                    log_q.put(("WARN",
+                        "  ⚠  TrueHD-Spur ist nicht MP4-kompatibel – "
+                        f"Wiederholung ohne TrueHD ({len(alle_audio) - len(kompatibel)} Spur(en) ausgelassen) …"))
+                    log_zeilen.append("  WARNUNG: TrueHD ausgelassen, Retry ohne TrueHD")
+                    if mp4_pfad.exists():
+                        mp4_pfad.unlink()
+                    return remux_zu_mp4(ffmpeg, mkv_pfad, mp4_pfad, log_q, task_q,
+                                        simulation, log_zeilen,
+                                        stopp_event=stopp_event,
+                                        text_sub_indices=text_sub_indices,
+                                        ffprobe_pfad=ffprobe_pfad,
+                                        audio_indices=kompatibel)
+
             # Return-Code: unsigned → signed für lesbare Anzeige (Windows)
             rc = proc.returncode
             if rc > 0x7FFFFFFF:
@@ -814,7 +876,8 @@ def verarbeite_serien(
                     erfolg = remux_zu_mp4(
                         ffmpeg, mkv_pfad, mp4_pfad,
                         log_q, task_q, simulation, log_zeilen,
-                        stopp_event=stopp_event, text_sub_indices=text_sub_indices)
+                        stopp_event=stopp_event, text_sub_indices=text_sub_indices,
+                        ffprobe_pfad=ffprobe)
                     if erfolg:
                         stats["remuxed"] += 1
                         neu_remuxed = True
@@ -985,7 +1048,8 @@ def verarbeite_sammlung(
             erfolg = remux_zu_mp4(
                 ffmpeg, mkv_pfad, mp4_pfad,
                 log_q, task_q, simulation, log_zeilen,
-                stopp_event=stopp_event, text_sub_indices=text_sub_indices
+                stopp_event=stopp_event, text_sub_indices=text_sub_indices,
+                ffprobe_pfad=ffprobe
             )
             if erfolg:
                 stats["remuxed"] += 1
@@ -1159,7 +1223,8 @@ def verarbeite_einzelordner(
         erfolg = remux_zu_mp4(
             ffmpeg, mkv_pfad, mp4_pfad,
             log_q, task_q, simulation, log_zeilen,
-            stopp_event=stopp_event, text_sub_indices=text_sub_indices)
+            stopp_event=stopp_event, text_sub_indices=text_sub_indices,
+            ffprobe_pfad=ffprobe)
         if erfolg:
             stats["remuxed"] += 1
             neu_remuxed = True
