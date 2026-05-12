@@ -1,5 +1,5 @@
 """
-dv_remux_gui.py  v5.0.1
+dv_remux_gui.py  v5.0.2
 =======================
 GUI-Tool: Dolby Vision MKV → MP4 Remux + SRT Untertitel-Extraktion
 Für Jellyfin / LG TV
@@ -14,6 +14,12 @@ Neu in v5.0.1:
   • TrueHD-Fallback: MKVs mit TrueHD-Atmos-Track (nicht MP4-kompatibel)
     werden automatisch ohne den TrueHD-Stream wiederholt – der EAC3-Track
     bleibt erhalten. Kein manuelles Eingreifen nötig.
+
+Neu in v5.0.2:
+  • Schließen-Button (✖) + X-Button mit Sicherheitsabfrage wenn ein
+    Prozess läuft; Config wird beim Beenden gespeichert.
+  • Autoscroll-Toggle im Log-Bereich: deaktivierbar um während eines
+    laufenden Prozesses im Log zu scrollen.
 
 Voraussetzungen:
   - Python 3.8+  (tkinter ist im Lieferumfang von Python enthalten)
@@ -1336,6 +1342,7 @@ class App(tk.Tk):
         self.var_nfo      = tk.BooleanVar(value=self.cfg.get("nfo",     True))
         self.var_modus      = tk.StringVar(value=self.cfg.get("modus",      "filme"))
         self.var_embed_subs = tk.BooleanVar(value=self.cfg.get("embed_subs", False))
+        self.var_autoscroll = tk.BooleanVar(value=True)
         self.stopp_event    = threading.Event()
 
         self._stil()
@@ -1345,6 +1352,7 @@ class App(tk.Tk):
         self._ffbin_status_update()
         self.var_modus.trace_add("write", lambda *_: self._modus_update())
         self.var_ffbin.trace_add("write", self._ffbin_status_update)
+        self.protocol("WM_DELETE_WINDOW", self._schliessen)
         self._poll()
 
     def _auto_ffbin(self) -> str:
@@ -1592,6 +1600,12 @@ class App(tk.Tk):
         self.btn_log.pack(side="left", padx=(8,0))
         ttk.Button(bf, text="🗑  Log leeren", style="Log.TButton",
                    command=self._log_leeren).pack(side="left", padx=(8,0))
+        self.btn_autoscroll = ttk.Button(
+            bf, text="[ON]  Autoscroll", style="ToggleOn.TButton",
+            command=self._toggle_autoscroll)
+        self.btn_autoscroll.pack(side="left", padx=(8,0))
+        ttk.Button(bf, text="✖  Schließen", style="Log.TButton",
+                   command=self._schliessen).pack(side="right")
 
         # ── Status-Zeile (eigene Reihe, damit sie nicht von Buttons überlagert wird)
         status_frame = ttk.Frame(self)
@@ -1692,6 +1706,41 @@ class App(tk.Tk):
         self.btn_stopp.configure(state="disabled")
         self.status_lbl.configure(text="⏳ Abbrechen …", fg=self.YELLOW)
 
+    # ─── Schließen (X-Button + Schließen-Button) ──────────────────────────────
+    def _schliessen(self):
+        if self.läuft:
+            antwort = messagebox.askyesno(
+                "Prozess läuft noch",
+                "Ein Remux-Prozess ist aktiv.\n\n"
+                "Jetzt wirklich beenden?\n"
+                "Der laufende Vorgang wird abgebrochen.",
+                icon="warning",
+                default="no"
+            )
+            if not antwort:
+                return
+            self.stopp_event.set()
+        config_speichern({
+            "ffbin":      self.var_ffbin.get(),
+            "root":       self.var_root.get(),
+            "behalten":   self.var_behalten.get(),
+            "subs":       self.var_subs.get(),
+            "nfo":        self.var_nfo.get(),
+            "modus":      self.var_modus.get(),
+            "embed_subs": self.var_embed_subs.get(),
+        })
+        self.destroy()
+
+    # ─── Autoscroll-Toggle ────────────────────────────────────────────────────
+    def _toggle_autoscroll(self):
+        val = not self.var_autoscroll.get()
+        self.var_autoscroll.set(val)
+        if val:
+            self.btn_autoscroll.configure(style="ToggleOn.TButton", text="[ON]  Autoscroll")
+            self.log_widget.see("end")
+        else:
+            self.btn_autoscroll.configure(style="Toggle.TButton",   text="[OFF] Autoscroll")
+
     # ─── Modus-Toggle ─────────────────────────────────────────────────────────
     def _set_modus(self, wert):
         self.var_modus.set(wert)
@@ -1767,7 +1816,8 @@ class App(tk.Tk):
         self.log_widget.configure(state="normal")
         self.log_widget.insert("end", text + "\n", typ)
         self.log_widget.configure(state="disabled")
-        self.log_widget.see("end")
+        if self.var_autoscroll.get():
+            self.log_widget.see("end")
 
     def _log_leeren(self):
         self.log_widget.configure(state="normal")
