@@ -1,5 +1,5 @@
 """
-dv_remux_gui.py  v5.0.2
+dv_remux_gui.py  v5.0.3
 =======================
 GUI-Tool: Dolby Vision MKV → MP4 Remux + SRT Untertitel-Extraktion
 Für Jellyfin / LG TV
@@ -21,6 +21,12 @@ Neu in v5.0.2:
   • Autoscroll-Toggle im Log-Bereich: deaktivierbar um während eines
     laufenden Prozesses im Log zu scrollen.
 
+Neu in v5.0.3:
+  • ✕-Button oben rechts in der Titelzeile (Schließen-Schutz).
+  • Info-Button (ℹ) mit GitHub-Link und Kontaktadresse.
+  • Hint-Texte anonymisiert (kein echter Filmname als Beispiel).
+  • Sekundär-Buttons einheitlich größer.
+
 Voraussetzungen:
   - Python 3.8+  (tkinter ist im Lieferumfang von Python enthalten)
   - ffmpeg + ffprobe (https://ffmpeg.org/download.html)
@@ -35,6 +41,7 @@ import shutil
 import threading
 import subprocess
 import xml.etree.ElementTree as ET
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 from pathlib import Path
@@ -44,7 +51,7 @@ from datetime import datetime
 #  KONSTANTEN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "5.0"
+VERSION      = "5.0.3"
 CONFIG_DATEI = Path(__file__).parent / "dv_remux_config.json"
 LOG_ORDNER   = Path(__file__).parent / "logs"
 TEXT_CODECS  = {"subrip", "ass", "ssa", "webvtt", "mov_text", "text", "srt"}
@@ -1421,7 +1428,7 @@ class App(tk.Tk):
         s.configure("Toggle.TButton",
             background=panel, foreground=text,
             font=("Consolas", 10), borderwidth=1, relief="flat",
-            padding=(10, 4))
+            padding=(11, 6))
         s.map("Toggle.TButton",
               background=[("active", panel2)],
               foreground=[("active", text)])
@@ -1429,7 +1436,7 @@ class App(tk.Tk):
         s.configure("ToggleOn.TButton",
             background=panel2, foreground=self.GREEN,
             font=("Consolas", 10, "bold"), borderwidth=1, relief="flat",
-            padding=(10, 4))
+            padding=(11, 6))
         s.map("ToggleOn.TButton",
               background=[("active", panel2)],
               foreground=[("active", self.GREEN)])
@@ -1451,8 +1458,18 @@ class App(tk.Tk):
         s.map("Browse.TButton", background=[("active","#3a3d50")])
 
         s.configure("Log.TButton", background=panel2, foreground=muted,
-                    font=("Consolas",9), borderwidth=0, relief="flat", padding=(7,3))
+                    font=("Consolas",10), borderwidth=0, relief="flat", padding=(11,6))
         s.map("Log.TButton", background=[("active","#2d333b")])
+
+        s.configure("Close.TButton", background=panel2, foreground=self.RED,
+                    font=("Consolas",13,"bold"), borderwidth=0, relief="flat", padding=(8,2))
+        s.map("Close.TButton", background=[("active","#3a1010")],
+                               foreground=[("active",self.RED)])
+
+        s.configure("Info.TButton", background=panel2, foreground=muted,
+                    font=("Consolas",11), borderwidth=0, relief="flat", padding=(8,2))
+        s.map("Info.TButton", background=[("active","#2d333b")],
+                              foreground=[("active",self.ACCENT)])
 
         s.configure("Main.Horizontal.TProgressbar",
                     troughcolor=panel, background=acc,
@@ -1466,6 +1483,11 @@ class App(tk.Tk):
         # Titelzeile
         t = ttk.Frame(self)
         t.pack(fill="x", padx=20, pady=(16,4))
+        # ✕-Schließen-Button oben rechts (vor den linken Labels packen, damit er Platz bekommt)
+        ttk.Button(t, text="✕", style="Close.TButton",
+                   command=self._schliessen).pack(side="right", padx=(4,0))
+        ttk.Button(t, text="ℹ", style="Info.TButton",
+                   command=self._info_dialog).pack(side="right", padx=(4,0))
         tk.Label(t, text="DV", fg=self.ACCENT2, bg=self.BG,
                  font=("Consolas",16,"bold")).pack(side="left")
         tk.Label(t, text=" Remux Tool", fg=self.TEXT, bg=self.BG,
@@ -1545,7 +1567,7 @@ class App(tk.Tk):
         # Hinweis-Label unter dem Quell-Ordner
         self.root_hint = tk.Label(
             panel,
-            text='  z.B. "Y:\\Shared Movies\\War Machine (2026)\\"  –  alle Unterordner werden durchsucht',
+            text='  z.B. "Y:\\Shared Movies\\Filmname (Jahr)\\"  –  alle Unterordner werden durchsucht',
             bg=self.PANEL, fg=self.MUTED, font=("Consolas", 8))
         self.root_hint.grid(row=3, column=1, padx=(0,6), pady=(2,0), sticky="w")
 
@@ -1604,8 +1626,6 @@ class App(tk.Tk):
             bf, text="[ON]  Autoscroll", style="ToggleOn.TButton",
             command=self._toggle_autoscroll)
         self.btn_autoscroll.pack(side="left", padx=(8,0))
-        ttk.Button(bf, text="✖  Schließen", style="Log.TButton",
-                   command=self._schliessen).pack(side="right")
 
         # ── Status-Zeile (eigene Reihe, damit sie nicht von Buttons überlagert wird)
         status_frame = ttk.Frame(self)
@@ -1741,6 +1761,37 @@ class App(tk.Tk):
         else:
             self.btn_autoscroll.configure(style="Toggle.TButton",   text="[OFF] Autoscroll")
 
+    # ─── Info-Dialog ──────────────────────────────────────────────────────────
+    def _info_dialog(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Über DV Remux Tool")
+        dlg.configure(bg=self.BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="DV Remux Tool", fg=self.ACCENT2, bg=self.BG,
+                 font=("Consolas",14,"bold")).pack(pady=(20,2))
+        tk.Label(dlg, text=f"Version  {VERSION}", fg=self.MUTED, bg=self.BG,
+                 font=("Consolas",10)).pack()
+        tk.Label(dlg, text="Dolby Vision MKV → MP4  •  Jellyfin / LG TV",
+                 fg=self.TEXT, bg=self.BG, font=("Consolas",9)).pack(pady=(4,16))
+
+        tk.Frame(dlg, bg=self.BORDER, height=1).pack(fill="x", padx=20)
+
+        # Anklickbarer GitHub-Link
+        REPO = "https://github.com/Hero9774/DolbyVision-Remux"
+        lnk = tk.Label(dlg, text=REPO, fg=self.ACCENT, bg=self.BG,
+                       font=("Consolas",9,"underline"), cursor="hand2")
+        lnk.pack(pady=(14,2))
+        lnk.bind("<Button-1>", lambda _: webbrowser.open(REPO))
+
+        tk.Label(dlg, text="hero.ommen@posteo.de", fg=self.MUTED, bg=self.BG,
+                 font=("Consolas",9)).pack(pady=(0,16))
+
+        ttk.Button(dlg, text="Schließen", style="Log.TButton",
+                   command=dlg.destroy).pack(pady=(0,16))
+
     # ─── Modus-Toggle ─────────────────────────────────────────────────────────
     def _set_modus(self, wert):
         self.var_modus.set(wert)
@@ -1772,15 +1823,15 @@ class App(tk.Tk):
         if modus == "serien":
             self.root_lbl.configure(text="Serien-Ordner (Root)")
             self.root_hint.configure(
-                text='  z.B. "Y:\\Shared TV Shows\\Star Trek SNW (2022)\\Season 01\\"  –  alle Shows/Staffeln werden durchsucht')
+                text='  z.B. "Y:\\Shared TV Shows\\Serienname (Jahr)\\Season 01\\"  –  alle Shows/Staffeln werden durchsucht')
         elif modus == "ordner":
             self.root_lbl.configure(text="Film-Ordner (direkt)")
             self.root_hint.configure(
-                text='  z.B. "D:\\Downloads\\War Machine (2026)\\"  –  der Ordner enthält direkt die .mkv-Datei')
+                text='  z.B. "D:\\Downloads\\Filmname (Jahr)\\"  –  der Ordner enthält direkt die .mkv-Datei')
         else:
             self.root_lbl.configure(text="Film-Ordner (Root)")
             self.root_hint.configure(
-                text='  z.B. "Y:\\Shared Movies\\War Machine (2026)\\"  –  alle Unterordner werden durchsucht')
+                text='  z.B. "Y:\\Shared Movies\\Filmname (Jahr)\\"  –  alle Unterordner werden durchsucht')
 
     def _ffbin_status_update(self, *_):
         """
