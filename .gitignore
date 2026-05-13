@@ -36,3 +36,7 @@ Desktop.ini
 
 # Backups der NFO-Dateien (werden vom Tool erzeugt)
 *.nfo.bak
+
+# Drittanbieter-Binaries (manuell herunterladen, siehe README)
+tools/dovi_tool.exe
+tools/dovi_tool

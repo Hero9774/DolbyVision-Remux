@@ -27,6 +27,19 @@ Neu in v5.0.3:
   • Hint-Texte anonymisiert (kein echter Filmname als Beispiel).
   • Sekundär-Buttons einheitlich größer.
 
+Neu in v5.2.0:
+  • DV Profil 5 → Profil 8 Konvertierung via dovi_tool (tools/dovi_tool.exe):
+    Profil-5-MKVs (ICtCp/IPT-PQ-C2, typisch bei WEB-DL-Releases) verursachen
+    Blaustich auf Geräten ohne nativen DV-Decoder. Das Tool wandelt das RPU
+    automatisch zu Profil 8 (HDR10-kompatibel) um – 3-Schritt-Pipeline:
+      1. HEVC extrahieren  2. dovi_tool P5→P8  3. MP4 zusammensetzen
+    Wenn dovi_tool fehlt: Warnung im Log, normaler Remux läuft weiter.
+
+Neu in v5.1.0:
+  • old-MKV-Ziel wählbar: "Im Filmordner" (wie bisher) oder "Globaler Ordner"
+    – bei globalem Ordner landen alle alten MKVs direkt im gewählten Pfad,
+      kein "old MKV"-Unterordner mehr im Quellverzeichnis.
+
 Voraussetzungen:
   - Python 3.8+  (tkinter ist im Lieferumfang von Python enthalten)
   - ffmpeg + ffprobe (https://ffmpeg.org/download.html)
@@ -38,6 +51,7 @@ import sys
 import json
 import queue
 import shutil
+import tempfile
 import threading
 import subprocess
 import xml.etree.ElementTree as ET
@@ -51,10 +65,11 @@ from datetime import datetime
 #  KONSTANTEN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "5.0.3"
+VERSION      = "5.2.0"
 CONFIG_DATEI = Path(__file__).parent / "dv_remux_config.json"
 LOG_ORDNER   = Path(__file__).parent / "logs"
 TEXT_CODECS  = {"subrip", "ass", "ssa", "webvtt", "mov_text", "text", "srt"}
+DOVI_TOOL    = Path(__file__).parent / "tools" / "dovi_tool.exe"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  EINSTELLUNGEN
@@ -228,6 +243,224 @@ def ermittle_hdrtype_aus_mkv(ffprobe: Path, mkv_pfad: Path):
     except Exception:
         pass
     return None
+
+
+def ermittle_dv_profil(ffprobe: Path, mkv_pfad: Path) -> tuple:
+    """DV-Profil und Farbmatrix aus MKV ermitteln (via ffprobe).
+    Gibt (dv_profil: int|None, farb_matrix: str|None) zurück.
+    DV Profil 5 + ICtCp (IPT-PQ-C2) verursacht auf Geräten ohne nativen
+    Dolby-Vision-Decoder einen typischen Farb-/Blaustich-Fehler.
+    """
+    befehl = [
+        str(ffprobe), "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-select_streams", "v:0", str(mkv_pfad)
+    ]
+    try:
+        erg = subprocess.run(befehl, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace",
+                             check=True, timeout=60)
+        daten = json.loads(erg.stdout)
+        streams = daten.get("streams", [])
+        if not streams:
+            return None, None
+        stream = streams[0]
+
+        dv_profil = None
+        for entry in stream.get("side_data_list", []):
+            if "dv_profile" in entry:
+                try:
+                    dv_profil = int(entry["dv_profile"])
+                except (ValueError, TypeError):
+                    pass
+                break
+
+        farb_matrix = stream.get("color_space") or stream.get("color_primaries")
+        return dv_profil, farb_matrix
+    except Exception:
+        return None, None
+
+
+def konvertiere_dv_p5_zu_p8(
+        ffmpeg: Path, dovi_tool: Path, ffprobe: Path,
+        mkv_pfad: Path, mp4_pfad: Path,
+        log_q: queue.Queue, task_q: queue.Queue,
+        simulation: bool, log_zeilen: list,
+        stopp_event=None) -> bool:
+    """
+    DV Profil 5 (ICtCp) → Profil 8 (HDR10-kompatibel) ohne Re-Encoding:
+      Schritt 1: HEVC-Stream extrahieren (ffmpeg -c:v copy)
+      Schritt 2: RPU konvertieren P5→P8 (dovi_tool -m 2 convert --discard)
+      Schritt 3: MP4 zusammensetzen (P8-HEVC + Audio aus Original-MKV)
+    Temp-Dateien werden in jedem Fall bereinigt (auch bei Fehler).
+    """
+    if simulation:
+        import time
+        msg = (f"  [SIM] P5->P8-Konvertierung wuerde stattfinden:\n"
+               f"    {mkv_pfad.name}\n    -> {mp4_pfad.name}")
+        log_q.put(("SIM",
+            f"  [SIM] P5→P8-Konvertierung würde stattfinden:\n"
+            f"    {mkv_pfad.name}\n    → {mp4_pfad.name}"))
+        log_zeilen.append(msg)
+        for p in range(0, 101, 5):
+            task_q.put({"sub_prog": p})
+            time.sleep(0.04)
+        return True
+
+    tmp_dir     = Path(tempfile.gettempdir())
+    tmp_hevc    = tmp_dir / f"_dv_remux_{mp4_pfad.stem}.hevc"
+    tmp_hevc_p8 = tmp_dir / f"_dv_remux_{mp4_pfad.stem}_p8.hevc"
+
+    def cleanup():
+        for tmp in (tmp_hevc, tmp_hevc_p8):
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    proc = None
+    try:
+        # ── Schritt 1: HEVC extrahieren ────────────────────────────────────
+        task_q.put({"schritt": "P5→P8 [1/3]: HEVC extrahieren …", "sub_prog": 0})
+        log_q.put(("INFO", "  🔬  [1/3] HEVC-Stream extrahieren …"))
+        log_zeilen.append("  [1/3] HEVC extrahieren")
+
+        befehl1 = [str(ffmpeg), "-i", str(mkv_pfad),
+                   "-c:v", "copy", "-an", "-sn", "-y", str(tmp_hevc)]
+        proc = subprocess.Popen(befehl1, stderr=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL,
+                                text=True, encoding="utf-8", errors="replace")
+        dauer_sek = None
+        for zeile in proc.stderr:
+            if stopp_event and stopp_event.is_set():
+                proc.terminate(); proc.wait(); cleanup()
+                log_q.put(("WARN", "  ⚠  P5→P8 abgebrochen."))
+                log_zeilen.append("  ABGEBROCHEN: P5->P8")
+                return False
+            zeile = zeile.rstrip()
+            if "Duration:" in zeile and dauer_sek is None:
+                try:
+                    teil = zeile.split("Duration:")[1].split(",")[0].strip()
+                    h, m, s = teil.split(":")
+                    dauer_sek = int(h)*3600 + int(m)*60 + float(s)
+                except Exception:
+                    pass
+            if zeile.startswith("frame=") and "time=" in zeile:
+                try:
+                    zeit_str = zeile.split("time=")[1].split()[0]
+                    h, m, s = zeit_str.split(":")
+                    vergangen = int(h)*3600 + int(m)*60 + float(s)
+                    if dauer_sek and dauer_sek > 0:
+                        task_q.put({"sub_prog": min(int(vergangen / dauer_sek * 33), 32)})
+                except Exception:
+                    pass
+        proc.wait()
+        if proc.returncode != 0:
+            log_q.put(("ERR", "  ❌ [1/3] HEVC-Extraktion fehlgeschlagen."))
+            log_zeilen.append("  FEHLER: HEVC-Extraktion")
+            cleanup(); return False
+        task_q.put({"sub_prog": 33})
+        log_q.put(("OK", "     ✅ HEVC extrahiert"))
+        log_zeilen.append("     OK: HEVC extrahiert")
+
+        # ── Schritt 2: RPU P5 → P8 konvertieren ───────────────────────────
+        task_q.put({"schritt": "P5→P8 [2/3]: RPU konvertieren …", "sub_prog": 33})
+        log_q.put(("INFO", "  🔬  [2/3] RPU Profil 5 → 8 (dovi_tool) …"))
+        log_zeilen.append("  [2/3] dovi_tool P5->P8")
+
+        befehl2 = [str(dovi_tool), "-m", "2", "convert", "--discard",
+                   str(tmp_hevc), "-o", str(tmp_hevc_p8)]
+        erg2 = subprocess.run(befehl2, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=600)
+        if erg2.returncode != 0:
+            fehler = (erg2.stderr or erg2.stdout or "").strip()[-300:]
+            log_q.put(("ERR", f"  ❌ dovi_tool Fehler (Code {erg2.returncode}):\n     {fehler}"))
+            log_zeilen.append(f"  FEHLER: dovi_tool Code {erg2.returncode}: {fehler}")
+            cleanup(); return False
+        task_q.put({"sub_prog": 66})
+        log_q.put(("OK", "     ✅ RPU zu Profil 8 konvertiert"))
+        log_zeilen.append("     OK: RPU Profil 8")
+
+        # ── Schritt 3: MP4 zusammensetzen ─────────────────────────────────
+        task_q.put({"schritt": "P5→P8 [3/3]: MP4 zusammensetzen …", "sub_prog": 66})
+        log_q.put(("INFO", f"  🔬  [3/3] MP4 zusammensetzen → {mp4_pfad.name}"))
+        log_zeilen.append(f"  [3/3] MP4 zusammensetzen: {mp4_pfad.name}")
+
+        # Audio: alle kompatiblen Spuren aus Original-MKV (TrueHD ausschließen)
+        alle_audio = ermittle_audio_streams(ffprobe, mkv_pfad)
+        kompatible = [s["index"] for s in alle_audio if s["codec"] != "truehd"]
+        audio_indizes = kompatible if kompatible else [s["index"] for s in alle_audio]
+        if len(kompatible) < len(alle_audio):
+            ausgelassen = len(alle_audio) - len(kompatible)
+            log_q.put(("WARN", f"  ⚠  {ausgelassen} TrueHD-Spur(en) ausgelassen (nicht MP4-kompatibel)"))
+            log_zeilen.append(f"  WARNUNG: {ausgelassen} TrueHD-Spur(en) ausgelassen")
+
+        audio_maps = []
+        for idx in audio_indizes:
+            audio_maps += ["-map", f"1:{idx}"]
+
+        befehl3 = ([str(ffmpeg),
+                    "-i", str(tmp_hevc_p8),
+                    "-i", str(mkv_pfad)]
+                   + ["-map", "0:v:0"] + audio_maps
+                   + ["-c", "copy", "-strict", "unofficial",
+                      "-tag:v", "hvc1", "-movflags", "+faststart",
+                      "-y", str(mp4_pfad)])
+
+        proc = subprocess.Popen(befehl3, stderr=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL,
+                                text=True, encoding="utf-8", errors="replace")
+        dauer_sek = None
+        stderr_z3 = []
+        for zeile in proc.stderr:
+            if stopp_event and stopp_event.is_set():
+                proc.terminate(); proc.wait(); cleanup()
+                log_q.put(("WARN", "  ⚠  P5→P8 abgebrochen."))
+                log_zeilen.append("  ABGEBROCHEN: P5->P8 Schritt 3")
+                return False
+            zeile = zeile.rstrip()
+            stderr_z3.append(zeile)
+            if "Duration:" in zeile and dauer_sek is None:
+                try:
+                    teil = zeile.split("Duration:")[1].split(",")[0].strip()
+                    h, m, s = teil.split(":")
+                    dauer_sek = int(h)*3600 + int(m)*60 + float(s)
+                except Exception:
+                    pass
+            if zeile.startswith("frame=") and "time=" in zeile:
+                try:
+                    zeit_str = zeile.split("time=")[1].split()[0]
+                    h, m, s = zeit_str.split(":")
+                    vergangen = int(h)*3600 + int(m)*60 + float(s)
+                    if dauer_sek and dauer_sek > 0:
+                        pct = 66 + min(int(vergangen / dauer_sek * 34), 33)
+                        task_q.put({"sub_prog": pct})
+                except Exception:
+                    pass
+                log_q.put(("PROG", f"     {zeile}"))
+        proc.wait()
+        if proc.returncode == 0:
+            task_q.put({"sub_prog": 100})
+            log_q.put(("OK", "     ✅ MP4 fertig (DV Profil 8 – HDR10-kompatibel)"))
+            log_zeilen.append("     OK: MP4 fertig (DV Profil 8)")
+            return True
+        else:
+            for z in stderr_z3[-15:]:
+                if z.strip():
+                    log_q.put(("ERR", f"     {z}"))
+                    log_zeilen.append(f"     {z}")
+            log_q.put(("ERR", "  ❌ [3/3] MP4-Zusammensetzen fehlgeschlagen."))
+            log_zeilen.append("  FEHLER: MP4-Zusammensetzen")
+            return False
+
+    except Exception as e:
+        log_q.put(("ERR", f"  ❌ P5→P8-Fehler: {e}"))
+        log_zeilen.append(f"  FEHLER P5->P8: {e}")
+        return False
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate(); proc.wait()
+        cleanup()
 
 
 def extrahiere_untertitel(ffmpeg: Path, mkv_pfad: Path, streams: list,
@@ -669,20 +902,26 @@ def schreibe_log_datei(log_zeilen: list, simulation: bool) -> Path:
 
 def verschiebe_oder_loesche_mkv(mkv_pfad: Path, original_behalten: bool,
                                 simulation: bool, log_func,
-                                undo_log: list = None) -> None:
+                                undo_log: list = None,
+                                old_mkv_global_pfad: Path = None) -> None:
     """MKV nach erfolgreichem Remux verschieben oder löschen."""
     if original_behalten:
-        ziel_ordner = mkv_pfad.parent / "old MKV"
-        ziel_pfad   = ziel_ordner / mkv_pfad.name
+        if old_mkv_global_pfad:
+            ziel_ordner = old_mkv_global_pfad
+            ziel_label  = str(old_mkv_global_pfad / mkv_pfad.name)
+        else:
+            ziel_ordner = mkv_pfad.parent / "old MKV"
+            ziel_label  = f"old MKV/{mkv_pfad.name}"
+        ziel_pfad = ziel_ordner / mkv_pfad.name
         if simulation:
-            log_func("SIM", f"  [SIM] Würde verschieben → old MKV/{mkv_pfad.name}")
+            log_func("SIM", f"  [SIM] Würde verschieben → {ziel_label}")
         elif ziel_pfad.exists():
-            log_func("WARN", f"  ⚠  old MKV/{mkv_pfad.name} bereits vorhanden – übersprungen.")
+            log_func("WARN", f"  ⚠  {mkv_pfad.name} bereits vorhanden – übersprungen.")
         else:
             try:
-                ziel_ordner.mkdir(exist_ok=True)
+                ziel_ordner.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(mkv_pfad), str(ziel_pfad))
-                log_func("OK", f"  📦  Verschoben → old MKV/{mkv_pfad.name}")
+                log_func("OK", f"  📦  Verschoben → {ziel_label}")
                 if undo_log is not None:
                     undo_log.append({"typ": "mkv_move",
                                      "von": ziel_pfad, "nach": mkv_pfad})
@@ -771,7 +1010,7 @@ def verarbeite_serien(
         untertitel: bool, nfo_update: bool, embed_subs: bool,
         log_q: queue.Queue, task_q: queue.Queue,
         fort_q: queue.Queue, done_q: queue.Queue,
-        stopp_event=None):
+        stopp_event=None, old_mkv_global_pfad: Path = None):
     """Serien-Worker: root → Show-Ordner → Staffel-Ordner → episode.mkv"""
 
     ffmpeg     = Path(ffmpeg_pfad)
@@ -854,6 +1093,20 @@ def verarbeite_serien(
                 stats["gefunden"] += 1
                 log("INFO", f"    🔵  {mkv_pfad.name}  [Dolby Vision]")
 
+                # DV-Profil-Prüfung: Profil 5 (ICtCp) → P5→P8-Konvertierung oder Warnung
+                braucht_p5_fix = False
+                dv_profil, farb_matrix = ermittle_dv_profil(ffprobe, mkv_pfad)
+                _ictcp = farb_matrix and "ictcp" in str(farb_matrix).lower()
+                if dv_profil == 5 or _ictcp:
+                    braucht_p5_fix = True
+                    if DOVI_TOOL.exists():
+                        log("WARN", (f"    ⚠️  DV-PROFIL {dv_profil or '?'} (ICtCp) erkannt "
+                                      "– wird zu Profil 8 konvertiert (dovi_tool) …"))
+                    else:
+                        log("WARN", (f"    ⚠️  DV-PROFIL {dv_profil or '?'} (ICtCp) erkannt "
+                                      "– dovi_tool nicht gefunden, Farbfehler im Output möglich!"))
+                        log("WARN",  "        dovi_tool.exe in tools/ ablegen um die Konvertierung zu aktivieren.")
+
                 # Untertitel-Streams ermitteln (vor Remux)
                 streams = []
                 if embed_subs or untertitel:
@@ -878,7 +1131,7 @@ def verarbeite_serien(
                         log("SKIP", f"    ⚠  Bitmap-Sub #{s['index']} [{s['language']}] "
                                     f"({s['codec'].upper()}) kann nicht eingebettet werden")
 
-                # Remux
+                # Remux (normaler Pfad) oder P5→P8-Konvertierung
                 neu_remuxed = False
                 if mp4_pfad.exists():
                     log("SKIP", f"    ✅ MP4 bereits vorhanden – übersprungen.")
@@ -886,11 +1139,19 @@ def verarbeite_serien(
                     task_q.put({"schritt": "MP4 bereits vorhanden", "sub_prog": 100})
                 else:
                     task_q.put({"schritt": "Remux läuft …", "sub_prog": None})
-                    erfolg = remux_zu_mp4(
-                        ffmpeg, mkv_pfad, mp4_pfad,
-                        log_q, task_q, simulation, log_zeilen,
-                        stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                        ffprobe_pfad=ffprobe)
+                    if braucht_p5_fix and DOVI_TOOL.exists():
+                        task_q.put({"schritt": "P5→P8-Konvertierung läuft …", "sub_prog": None})
+                        erfolg = konvertiere_dv_p5_zu_p8(
+                            ffmpeg, DOVI_TOOL, ffprobe,
+                            mkv_pfad, mp4_pfad,
+                            log_q, task_q, simulation, log_zeilen,
+                            stopp_event=stopp_event)
+                    else:
+                        erfolg = remux_zu_mp4(
+                            ffmpeg, mkv_pfad, mp4_pfad,
+                            log_q, task_q, simulation, log_zeilen,
+                            stopp_event=stopp_event, text_sub_indices=text_sub_indices,
+                            ffprobe_pfad=ffprobe)
                     if erfolg:
                         stats["remuxed"] += 1
                         neu_remuxed = True
@@ -925,7 +1186,8 @@ def verarbeite_serien(
                 if neu_remuxed:
                     verschiebe_oder_loesche_mkv(
                         mkv_pfad, original_behalten, simulation, log,
-                        undo_log=undo_log)
+                        undo_log=undo_log,
+                        old_mkv_global_pfad=old_mkv_global_pfad)
 
                 # NFO aktualisieren
                 if nfo_update and nfo_pfad.exists():
@@ -963,7 +1225,7 @@ def verarbeite_sammlung(
         untertitel: bool, nfo_update: bool, embed_subs: bool,
         log_q: queue.Queue, task_q: queue.Queue,
         fort_q: queue.Queue, done_q: queue.Queue,
-        stopp_event=None):
+        stopp_event=None, old_mkv_global_pfad: Path = None):
     """Haupt-Worker (eigener Thread)."""
 
     ffmpeg  = Path(ffmpeg_pfad)
@@ -1025,6 +1287,20 @@ def verarbeite_sammlung(
         nfo_pfad = ordner / "movie.nfo"
         mp4_pfad = mkv_pfad.with_suffix(".mp4")
 
+        # DV-Profil-Prüfung: Profil 5 (ICtCp) → P5→P8-Konvertierung oder Warnung
+        braucht_p5_fix = False
+        dv_profil, farb_matrix = ermittle_dv_profil(ffprobe, mkv_pfad)
+        _ictcp = farb_matrix and "ictcp" in str(farb_matrix).lower()
+        if dv_profil == 5 or _ictcp:
+            braucht_p5_fix = True
+            if DOVI_TOOL.exists():
+                log("WARN", (f"  ⚠️  DV-PROFIL {dv_profil or '?'} (ICtCp) erkannt "
+                              "– wird zu Profil 8 konvertiert (dovi_tool) …"))
+            else:
+                log("WARN", (f"  ⚠️  DV-PROFIL {dv_profil or '?'} (ICtCp) erkannt "
+                              "– dovi_tool nicht gefunden, Farbfehler im Output möglich!"))
+                log("WARN",  "      dovi_tool.exe in tools/ ablegen um die Konvertierung zu aktivieren.")
+
         # 3. Untertitel-Streams ermitteln (vor Remux, für Einbettung + SRT)
         streams = []
         if embed_subs or untertitel:
@@ -1056,14 +1332,22 @@ def verarbeite_sammlung(
             stats["uebersprungen"] += 1
             task_q.put({"schritt": "MP4 bereits vorhanden", "sub_prog": 100})
         else:
-            # 5. Remux
+            # 5. Remux (normaler Pfad) oder P5→P8-Konvertierung
             task_q.put({"schritt": "Remux läuft …", "sub_prog": None})
-            erfolg = remux_zu_mp4(
-                ffmpeg, mkv_pfad, mp4_pfad,
-                log_q, task_q, simulation, log_zeilen,
-                stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                ffprobe_pfad=ffprobe
-            )
+            if braucht_p5_fix and DOVI_TOOL.exists():
+                task_q.put({"schritt": "P5→P8-Konvertierung läuft …", "sub_prog": None})
+                erfolg = konvertiere_dv_p5_zu_p8(
+                    ffmpeg, DOVI_TOOL, ffprobe,
+                    mkv_pfad, mp4_pfad,
+                    log_q, task_q, simulation, log_zeilen,
+                    stopp_event=stopp_event)
+            else:
+                erfolg = remux_zu_mp4(
+                    ffmpeg, mkv_pfad, mp4_pfad,
+                    log_q, task_q, simulation, log_zeilen,
+                    stopp_event=stopp_event, text_sub_indices=text_sub_indices,
+                    ffprobe_pfad=ffprobe
+                )
             if erfolg:
                 stats["remuxed"] += 1
                 neu_remuxed = True
@@ -1098,7 +1382,8 @@ def verarbeite_sammlung(
         if neu_remuxed:
             verschiebe_oder_loesche_mkv(
                 mkv_pfad, original_behalten, simulation, log,
-                undo_log=undo_log)
+                undo_log=undo_log,
+                old_mkv_global_pfad=old_mkv_global_pfad)
 
         # 8. NFO aktualisieren
         if nfo_update and nfo_pfad.exists():
@@ -1143,7 +1428,7 @@ def verarbeite_einzelordner(
         untertitel: bool, nfo_update: bool, embed_subs: bool,
         log_q: queue.Queue, task_q: queue.Queue,
         fort_q: queue.Queue, done_q: queue.Queue,
-        stopp_event=None):
+        stopp_event=None, old_mkv_global_pfad: Path = None):
     """Einzelordner-Worker: verarbeitet genau einen Film-Ordner (direkt MKV darin)."""
 
     ffmpeg  = Path(ffmpeg_pfad)
@@ -1199,6 +1484,20 @@ def verarbeite_einzelordner(
     stats["gefunden"] += 1
     mp4_pfad = mkv_pfad.with_suffix(".mp4")
 
+    # DV-Profil-Prüfung: Profil 5 (ICtCp) → P5→P8-Konvertierung oder Warnung
+    braucht_p5_fix = False
+    dv_profil, farb_matrix = ermittle_dv_profil(ffprobe, mkv_pfad)
+    _ictcp = farb_matrix and "ictcp" in str(farb_matrix).lower()
+    if dv_profil == 5 or _ictcp:
+        braucht_p5_fix = True
+        if DOVI_TOOL.exists():
+            log("WARN", (f"  ⚠️  DV-PROFIL {dv_profil or '?'} (ICtCp) erkannt "
+                          "– wird zu Profil 8 konvertiert (dovi_tool) …"))
+        else:
+            log("WARN", (f"  ⚠️  DV-PROFIL {dv_profil or '?'} (ICtCp) erkannt "
+                          "– dovi_tool nicht gefunden, Farbfehler im Output möglich!"))
+            log("WARN",  "      dovi_tool.exe in tools/ ablegen um die Konvertierung zu aktivieren.")
+
     # Untertitel-Streams ermitteln
     streams = []
     if embed_subs or untertitel:
@@ -1225,7 +1524,7 @@ def verarbeite_einzelordner(
 
     fort_q.put(10)
 
-    # Remux
+    # Remux (normaler Pfad) oder P5→P8-Konvertierung
     neu_remuxed = False
     if mp4_pfad.exists():
         log("SKIP", "  ✅ MP4 existiert bereits – übersprungen.")
@@ -1233,11 +1532,19 @@ def verarbeite_einzelordner(
         task_q.put({"schritt": "MP4 bereits vorhanden", "sub_prog": 100})
     else:
         task_q.put({"schritt": "Remux läuft …", "sub_prog": None})
-        erfolg = remux_zu_mp4(
-            ffmpeg, mkv_pfad, mp4_pfad,
-            log_q, task_q, simulation, log_zeilen,
-            stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-            ffprobe_pfad=ffprobe)
+        if braucht_p5_fix and DOVI_TOOL.exists():
+            task_q.put({"schritt": "P5→P8-Konvertierung läuft …", "sub_prog": None})
+            erfolg = konvertiere_dv_p5_zu_p8(
+                ffmpeg, DOVI_TOOL, ffprobe,
+                mkv_pfad, mp4_pfad,
+                log_q, task_q, simulation, log_zeilen,
+                stopp_event=stopp_event)
+        else:
+            erfolg = remux_zu_mp4(
+                ffmpeg, mkv_pfad, mp4_pfad,
+                log_q, task_q, simulation, log_zeilen,
+                stopp_event=stopp_event, text_sub_indices=text_sub_indices,
+                ffprobe_pfad=ffprobe)
         if erfolg:
             stats["remuxed"] += 1
             neu_remuxed = True
@@ -1277,7 +1584,8 @@ def verarbeite_einzelordner(
     # MKV verschieben / löschen
     if neu_remuxed:
         verschiebe_oder_loesche_mkv(
-            mkv_pfad, original_behalten, simulation, log, undo_log=undo_log)
+            mkv_pfad, original_behalten, simulation, log, undo_log=undo_log,
+            old_mkv_global_pfad=old_mkv_global_pfad)
 
     # NFO aktualisieren
     if nfo_update and nfo_pfad.exists():
@@ -1347,9 +1655,11 @@ class App(tk.Tk):
         self.var_behalten = tk.BooleanVar(value=self.cfg.get("behalten",True))
         self.var_subs     = tk.BooleanVar(value=self.cfg.get("subs",    True))
         self.var_nfo      = tk.BooleanVar(value=self.cfg.get("nfo",     True))
-        self.var_modus      = tk.StringVar(value=self.cfg.get("modus",      "filme"))
-        self.var_embed_subs = tk.BooleanVar(value=self.cfg.get("embed_subs", False))
-        self.var_autoscroll = tk.BooleanVar(value=True)
+        self.var_modus          = tk.StringVar(value=self.cfg.get("modus",          "filme"))
+        self.var_embed_subs     = tk.BooleanVar(value=self.cfg.get("embed_subs",     False))
+        self.var_old_mkv_modus  = tk.StringVar(value=self.cfg.get("old_mkv_modus",  "lokal"))
+        self.var_old_mkv_pfad   = tk.StringVar(value=self.cfg.get("old_mkv_pfad",   ""))
+        self.var_autoscroll     = tk.BooleanVar(value=True)
         self.stopp_event    = threading.Event()
 
         self._stil()
@@ -1357,6 +1667,7 @@ class App(tk.Tk):
         self._modus_update()
         self._toggle_styles_update()
         self._ffbin_status_update()
+        self._dovi_status_update()
         self.var_modus.trace_add("write", lambda *_: self._modus_update())
         self.var_ffbin.trace_add("write", self._ffbin_status_update)
         self.protocol("WM_DELETE_WINDOW", self._schliessen)
@@ -1543,11 +1854,17 @@ class App(tk.Tk):
                    command=wähle_ffbin, width=4).grid(
             row=0, column=2, padx=(0,12), pady=(9,0))
 
-        # Status-Label: zeigt ob ffmpeg+ffprobe im gewählten Ordner gefunden werden
+        # Status-Frame row=1: ffmpeg/ffprobe + dovi_tool (zwei Zeilen)
+        _status_frame = tk.Frame(panel, bg=self.PANEL)
+        _status_frame.grid(row=1, column=1, padx=(0,6), pady=(2,4), sticky="w")
+
         self.ffbin_status = tk.Label(
-            panel, text="", bg=self.PANEL,
-            font=("Consolas", 8))
-        self.ffbin_status.grid(row=1, column=1, padx=(0,6), pady=(2,0), sticky="w")
+            _status_frame, text="", bg=self.PANEL, font=("Consolas", 8))
+        self.ffbin_status.pack(anchor="w")
+
+        self.dovi_status = tk.Label(
+            _status_frame, text="", bg=self.PANEL, font=("Consolas", 8))
+        self.dovi_status.pack(anchor="w")
 
         # ── Zeile 2: Quell-Ordner ─────────────────────────────────────────
         self.root_lbl = ttk.Label(panel, text="Film-Ordner (Root)", style="Muted.TLabel")
@@ -1600,6 +1917,37 @@ class App(tk.Tk):
                              command=lambda v=var: self._toggle_opt(v))
             btn.pack(side="left", padx=(0,6))
             self._opt_btns[id(var)] = (btn, var, label)
+
+        # ── Zeile 6: old-MKV-Ziel ────────────────────────────────────────
+        old_ziel_frame = ttk.Frame(panel, style="Panel.TFrame")
+        old_ziel_frame.grid(row=6, column=0, columnspan=3, sticky="w", padx=12, pady=(2,2))
+        tk.Label(old_ziel_frame, text="MKV-Ziel:", bg=self.PANEL, fg=self.MUTED,
+                 font=("Consolas", 9)).pack(side="left", padx=(0,10))
+        self._old_mkv_ziel_btns = {}
+        for wert, label in [("lokal", "Im Filmordner"), ("global", "Globaler Ordner")]:
+            btn = ttk.Button(old_ziel_frame, text=label,
+                             command=lambda v=wert: self._set_old_mkv_modus(v))
+            btn.pack(side="left", padx=(0,4))
+            self._old_mkv_ziel_btns[wert] = btn
+
+        # ── Zeile 7: Pfad für globalen Ordner ────────────────────────────
+        old_pfad_frame = ttk.Frame(panel, style="Panel.TFrame")
+        old_pfad_frame.grid(row=7, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,8))
+        old_pfad_frame.columnconfigure(1, weight=1)
+        ttk.Label(old_pfad_frame, text="Ziel-Ordner", style="Muted.TLabel").grid(
+            row=0, column=0, padx=(0,8), pady=(4,0), sticky="w")
+        self.old_mkv_pfad_entry = ttk.Entry(old_pfad_frame, textvariable=self.var_old_mkv_pfad)
+        self.old_mkv_pfad_entry.grid(row=0, column=1, padx=(0,6), pady=(4,0), sticky="ew", ipady=4)
+        def wähle_old_mkv_pfad():
+            p = filedialog.askdirectory(
+                title="Globalen Zielordner für old MKV wählen",
+                initialdir=self.var_old_mkv_pfad.get() or "/")
+            if p:
+                self.var_old_mkv_pfad.set(p)
+        self.old_mkv_pfad_btn = ttk.Button(
+            old_pfad_frame, text="📂", style="Browse.TButton",
+            command=wähle_old_mkv_pfad, width=4)
+        self.old_mkv_pfad_btn.grid(row=0, column=2, padx=(0,0), pady=(4,0))
 
         # ── Button-Leiste ─────────────────────────────────────────────────
         bf = ttk.Frame(self)
@@ -1741,13 +2089,15 @@ class App(tk.Tk):
                 return
             self.stopp_event.set()
         config_speichern({
-            "ffbin":      self.var_ffbin.get(),
-            "root":       self.var_root.get(),
-            "behalten":   self.var_behalten.get(),
-            "subs":       self.var_subs.get(),
-            "nfo":        self.var_nfo.get(),
-            "modus":      self.var_modus.get(),
-            "embed_subs": self.var_embed_subs.get(),
+            "ffbin":          self.var_ffbin.get(),
+            "root":           self.var_root.get(),
+            "behalten":       self.var_behalten.get(),
+            "subs":           self.var_subs.get(),
+            "nfo":            self.var_nfo.get(),
+            "modus":          self.var_modus.get(),
+            "embed_subs":     self.var_embed_subs.get(),
+            "old_mkv_modus":  self.var_old_mkv_modus.get(),
+            "old_mkv_pfad":   self.var_old_mkv_pfad.get(),
         })
         self.destroy()
 
@@ -1801,6 +2151,10 @@ class App(tk.Tk):
         var.set(not var.get())
         self._toggle_styles_update()
 
+    def _set_old_mkv_modus(self, wert):
+        self.var_old_mkv_modus.set(wert)
+        self._toggle_styles_update()
+
     def _toggle_styles_update(self):
         """Alle Toggle-Buttons aktualisieren: aktiv = grün + [ON], inaktiv = weiß + [OFF]."""
         modus = self.var_modus.get()
@@ -1815,6 +2169,23 @@ class App(tk.Tk):
                 btn.configure(style="ToggleOn.TButton", text=f"[ON]  {label}")
             else:
                 btn.configure(style="Toggle.TButton", text=f"[OFF] {label}")
+
+        # MKV-Ziel: nur aktiv wenn "MKV verschieben" an
+        behalten      = self.var_behalten.get()
+        old_mkv_modus = self.var_old_mkv_modus.get()
+        if hasattr(self, "_old_mkv_ziel_btns"):
+            for wert, btn in self._old_mkv_ziel_btns.items():
+                if not behalten:
+                    btn.configure(style="Toggle.TButton", state="disabled")
+                elif wert == old_mkv_modus:
+                    btn.configure(style="ToggleOn.TButton", state="normal")
+                else:
+                    btn.configure(style="Toggle.TButton", state="normal")
+        if hasattr(self, "old_mkv_pfad_entry"):
+            ist_global = behalten and old_mkv_modus == "global"
+            state = "normal" if ist_global else "disabled"
+            self.old_mkv_pfad_entry.configure(state=state)
+            self.old_mkv_pfad_btn.configure(state=state)
 
     # ─── Modus-Label aktualisieren ────────────────────────────────────────────
     def _modus_update(self):
@@ -1861,6 +2232,23 @@ class App(tk.Tk):
         farbe = self.GREEN if (ffmpeg_ok and ffprobe_ok) else self.RED
         self.ffbin_status.configure(
             text="  " + "   ".join(teile), fg=farbe)
+
+    def _dovi_status_update(self):
+        """Prüft ob dovi_tool.exe in tools/ vorhanden ist und zeigt Status."""
+        if DOVI_TOOL.exists():
+            self.dovi_status.configure(
+                text="  ✅ dovi_tool", fg=self.GREEN, cursor="")
+            self.dovi_status.unbind("<Button-1>")
+        else:
+            self.dovi_status.configure(
+                text=("  ⚠  dovi_tool fehlt  "
+                      "(für DV-Profil-5-Konvertierung)  "
+                      "→ Download ↗  [→ in tools/ ablegen]"),
+                fg=self.YELLOW, cursor="hand2")
+            self.dovi_status.bind(
+                "<Button-1>",
+                lambda e: webbrowser.open(
+                    "https://github.com/quietvoid/dovi_tool/releases"))
 
     # ─── Log ──────────────────────────────────────────────────────────────────
     def _log(self, typ: str, text: str):
@@ -1919,13 +2307,15 @@ class App(tk.Tk):
             return
 
         config_speichern({
-            "ffbin":      self.var_ffbin.get(),
-            "root":       self.var_root.get(),
-            "behalten":   self.var_behalten.get(),
-            "subs":       self.var_subs.get(),
-            "nfo":        self.var_nfo.get(),
-            "modus":      self.var_modus.get(),
-            "embed_subs": self.var_embed_subs.get(),
+            "ffbin":          self.var_ffbin.get(),
+            "root":           self.var_root.get(),
+            "behalten":       self.var_behalten.get(),
+            "subs":           self.var_subs.get(),
+            "nfo":            self.var_nfo.get(),
+            "modus":          self.var_modus.get(),
+            "embed_subs":     self.var_embed_subs.get(),
+            "old_mkv_modus":  self.var_old_mkv_modus.get(),
+            "old_mkv_pfad":   self.var_old_mkv_pfad.get(),
         })
 
         self.stopp_event.clear()
@@ -1956,6 +2346,13 @@ class App(tk.Tk):
         worker = (verarbeite_serien       if modus == "serien"
                   else verarbeite_einzelordner if modus == "ordner"
                   else verarbeite_sammlung)
+
+        old_mkv_global = None
+        if self.var_behalten.get() and self.var_old_mkv_modus.get() == "global":
+            p = self.var_old_mkv_pfad.get().strip()
+            if p:
+                old_mkv_global = Path(p)
+
         threading.Thread(
             target=worker,
             args=(
@@ -1972,6 +2369,7 @@ class App(tk.Tk):
                 self.fort_queue,
                 self.done_queue,
                 self.stopp_event,
+                old_mkv_global,
             ),
             daemon=True
         ).start()
