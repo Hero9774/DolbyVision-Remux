@@ -24,6 +24,8 @@ GUI-Tool für **Batch-Remux von Dolby-Vision-MKV-Dateien zu MP4** — ohne Re-En
 - [Wie funktioniert das Remux?](#wie-funktioniert-das-remux)
 - [Hinweise zu Dolby Vision](#hinweise-zu-dolby-vision)
 - [Troubleshooting](#troubleshooting)
+- [Changelog](#changelog)
+- [Drittanbieter-Komponenten](#drittanbieter-komponenten)
 - [Lizenz](#lizenz)
 
 ---
@@ -32,7 +34,9 @@ GUI-Tool für **Batch-Remux von Dolby-Vision-MKV-Dateien zu MP4** — ohne Re-En
 
 - **Verlustfreies Remux** von MKV → MP4 (`-c copy`, kein Re-Encoding, kein Qualitätsverlust)
 - HEVC-Tag-Korrektur auf `hvc1` für **LG TV-Kompatibilität**
-- `+faststart` für **schnelles Streaming-Start** in Jellyfin
+- **dvcC-Box Injektion** — Dolby Vision Configuration Record wird direkt per Python-Binärpatch in die MP4 geschrieben; ohne diese Box erkennt Jellyfin / LG TV kein DV im MP4-Container
+- **faststart + mp42** — `moov`-Atom vor `mdat` verschieben und `major_brand` auf `mp42` setzen für optimale Player-Kompatibilität
+- **DV-Profil-5 → Profil-8.1-Konvertierung** (Blaustich-Fix) via `dovi_tool -m 3 convert` — 5-Schritt-Pipeline ohne Re-Encoding
 - **Drei Modi:**
   - **Filme** — verarbeitet alle Unterordner eines Root-Verzeichnisses (ein MKV pro Ordner)
   - **Serien** — rekursive Verarbeitung von Staffel/Episode-Strukturen
@@ -54,10 +58,14 @@ GUI-Tool für **Batch-Remux von Dolby-Vision-MKV-Dateien zu MP4** — ohne Re-En
 | Python | 3.8+ | `tkinter` ist im Lieferumfang |
 | ffmpeg | aktuell | nur im Echtlauf nötig |
 | ffprobe | aktuell | nur im Echtlauf nötig |
+| dovi_tool | aktuell | **optional** — nur für DV-Profil-5-Konvertierung |
 
 Im **Simulationsmodus** sind weder ffmpeg noch ffprobe erforderlich — ideal zum Testen der Pipeline.
 
 ffmpeg-Download: <https://ffmpeg.org/download.html>
+
+dovi_tool-Download: <https://github.com/quietvoid/dovi_tool/releases>
+→ `dovi_tool.exe` in den Ordner `tools/` legen. Die GUI zeigt den Status automatisch an.
 
 ---
 
@@ -214,7 +222,7 @@ D:/Downloads/Film C (2025)/
 
 ## Konfigurationsdatei
 
-Beim Schließen wird `dv_remux_config.json` automatisch gespeichert:
+Beim Schließen wird `config/dv_remux_config.json` automatisch gespeichert (der Ordner `config/` wird beim ersten Start automatisch angelegt):
 
 ```json
 {
@@ -244,23 +252,28 @@ Eine Beispieldatei findest du in [`dv_remux_config.example.json`](dv_remux_confi
 
 ## Wie funktioniert das Remux?
 
-Das eigentliche Remux ist ein **simpler ffmpeg-Aufruf** ohne Re-Encoding:
+### Normaler DV-Pfad (Profil 7 / 8)
 
+Der Remux-Prozess läuft in **drei Phasen**:
+
+**Phase 1 — ffmpeg (ohne faststart):**
 ```bash
-ffmpeg -i "input.mkv" \
-       -c copy \
-       -tag:v hvc1 \
-       -map 0:v -map 0:a \
-       -movflags +faststart \
-       "output.mp4"
+ffmpeg -i "input.mkv" -c copy -tag:v hvc1 -map 0:v -map 0:a "output.mp4"
 ```
 
 | Flag | Wirkung |
 |---|---|
 | `-c copy` | Streams 1:1 kopieren — kein Re-Encoding, keine Qualitätsverluste |
-| `-tag:v hvc1` | HEVC-Codec-Tag wird auf `hvc1` gesetzt (LG TV erwartet das, statt `hev1`) |
+| `-tag:v hvc1` | HEVC-Codec-Tag auf `hvc1` setzen (LG TV erwartet das, statt `hev1`) |
 | `-map 0:v -map 0:a` | Nur Video- und Audio-Streams übernehmen |
-| `-movflags +faststart` | `moov`-Atom an den Anfang verschieben → schnelles Streaming-Start |
+
+**Phase 2 — dvcC-Box injizieren** (Python-Binärpatch, kein externes Tool):
+
+Das Tool navigiert im `moov`-Atom den Pfad `trak → mdia → minf → stbl → stsd → hvc1/dvh1` und fügt eine 16-Byte-`dvcC`-Box direkt nach der `hvcC`-Box ein. Ohne diese Box erkennt Jellyfin und LG TV kein Dolby Vision im MP4-Container. Ist die Box bereits vorhanden, wird sie übersprungen.
+
+**Phase 3 — faststart + mp42** (Python, kein ffmpeg):
+
+`moov` wird vor `mdat` verschoben und `major_brand` auf `mp42` gesetzt. Die `stco`/`co64`-Chunk-Offsets werden entsprechend korrigiert.
 
 Untertitel-Streams werden separat behandelt:
 
@@ -280,7 +293,26 @@ Die Erkennung läuft zweistufig:
 
 Wenn keine NFO existiert oder kein DV erkannt wird, wird der Film im Log als `[SKIP]` markiert.
 
-> Hinweis: Das Tool **konvertiert keine DV-Profile**. Es kopiert die vorhandenen Streams unverändert. Profile wie DV 5, DV 7 oder DV 8 bleiben so wie sie in der MKV vorliegen. Für LG TVs ist hauptsächlich Profil 7/8 relevant — prüfe vor dem Remux, ob deine Quelle damit kompatibel ist.
+### DV-Profil-5-Konvertierung (Blaustich-Fix)
+
+**Dolby Vision Profil 5** (typisch bei WEB-DL-Releases, erkennbar an `dvhe.05` / `IPT-PQ-C2` in MediaInfo) verwendet den **ICtCp-Farbraum** statt Standard-YUV. Geräte ohne nativen DV-Decoder interpretieren diese Daten als YUV — das Ergebnis ist ein starker **Farb-/Blaustich**.
+
+Wenn `dovi_tool.exe` in `tools/` vorhanden ist, läuft eine **5-Schritt-Pipeline** vollautomatisch:
+
+| Schritt | Aktion |
+|---|---|
+| **[1/5] HEVC extrahieren** | `ffmpeg -c:v copy -an -sn` → `%TEMP%\_dv_remux_*.hevc` |
+| **[2/5] RPU P5 → P8.1** | `dovi_tool -m 3 convert` — Modus 3 ist explizit für Profil 5 → 8.1 |
+| **[3/5] MP4 zusammensetzen** | P8-HEVC + Audio aus Original-MKV, `-tag:v dvh1`, kein faststart |
+| **[4/5] dvcC injizieren** | Dolby Vision Configuration Record (Profil 8.1, Level auto, compat_id=1) |
+| **[5/5] faststart + mp42** | `moov` vor `mdat`, `major_brand = mp42` |
+
+Der DV-Level in der dvcC-Box wird automatisch aus Auflösung und Bildrate berechnet. Temp-Dateien in `%TEMP%` werden in jedem Fall bereinigt. Fehlt `dovi_tool.exe`, läuft der normale Remux durch — mit Warnung im Log.
+
+**Erkennung von Profil 5** (dreistufig, ohne NFO):
+1. `dv_profile` direkt aus `ffprobe`-Stream-Side-Data
+2. `dv_bl_signal_compatibility_id == 0` → typisch für Profil 5 (kein HDR10-Fallback)
+3. Frame-Level-Fallback via `ffprobe -read_intervals %+#1 -show_frames`
 
 ---
 
@@ -291,12 +323,51 @@ Wenn keine NFO existiert oder kein DV erkannt wird, wird der Film im Log als `[S
 | **„ffmpeg nicht gefunden"** | `ffbin`-Pfad zeigt nicht auf den Ordner mit `ffmpeg.exe`. Vollen Pfad zum `bin/`-Verzeichnis setzen. |
 | **„Keine MKV gefunden"** | Im Modus „Ordner" enthält der gewählte Ordner keine `.mkv`-Datei. |
 | **Film wird mit `[SKIP]` markiert** | Kein `<hdrtype>dolbyvision</hdrtype>` in `movie.nfo` und ffprobe findet keine DOVI-Side-Data. |
-| **LG TV spielt MP4 nicht ab** | Prüfe, ob `-tag:v hvc1` gesetzt war (sollte automatisch passieren). Eventuell DV-Profil nicht von deinem TV unterstützt. |
+| **LG TV spielt MP4 nicht ab** | Ab v5.3 wird automatisch eine dvcC-Box injiziert und mp42 gesetzt. Bei älteren Outputs: MP4 erneut verarbeiten. |
 | **NFO-Backup wiederherstellen** | `movie.nfo.bak` einfach zurück nach `movie.nfo` kopieren. |
 | **MP4 hat keine Untertitel im Player** | „Subs einbetten" muss aktiv sein **und** der Quell-Subtitle-Codec muss text-basiert sein (subrip/ass/ssa/webvtt/mov_text/srt). PGS/VobSub werden übersprungen. |
 | **Tool friert kurz ein** | Beim Start eines neuen Films läuft `ffprobe` — kann je nach Datei einige Sekunden dauern. |
 
 Bei Fehlern lohnt sich immer ein Blick ins Log unter `logs/`.
+
+---
+
+## Changelog
+
+### v5.5.0
+- **dvcC-Box** wird jetzt auch im normalen DV-Pfad (Profil 7/8) automatisch geprüft und injiziert
+- **faststart + mp42** für alle Ausgabedateien — reiner Python-Binärpatch, kein ffmpeg-Aufruf
+- Konfigurationsdatei in Unterordner `config/` verschoben (wird beim Start automatisch angelegt)
+- `stco`/`co64`-Chunk-Offsets werden nach moov-Verschiebung korrekt aktualisiert
+
+### v5.3.0
+- **dvcC-Box Injektion** via Python-Binärpatch (`struct`): Dolby Vision Configuration Record direkt in die MP4 schreiben
+- **5-Schritt-Pipeline** für P5→P8: HEVC → dovi_tool → MP4 (kein faststart) → dvcC → faststart+mp42
+- **DV-Level-Berechnung** aus Auflösung + Bildrate für korrekte dvcC-Metadaten
+- **Duplikat-Untertitel-Erkennung** — gleiche Sprache mehrfach vorhanden: nur erste Spur extrahiert, Rest als `[SKIP]` geloggt
+
+### v5.2.0
+- **DV-Profil-5-Erkennung** + automatische P5→P8.1-Konvertierung via `dowi_tool -m 3 convert` (Blaustich-Fix für ICtCp-WEB-DL-Releases)
+- Dreistufige Profil-5-Erkennung: Stream-Side-Data → `dv_bl_signal_compatibility_id` → Frame-Level-Fallback
+
+### v5.1.0
+- MKV-Zielordner wählbar: „Im Filmordner" oder globaler Ordner
+
+### v5.0.x
+- `v5.0.3`: Info-Button (ℹ), ✕-Button oben rechts, Buttons vereinheitlicht
+- `v5.0.2`: Schließen-Schutz + Autoscroll-Toggle
+- `v5.0.1`: TrueHD-Fallback (TrueHD-Spur automatisch ausgelassen, EAC3 bleibt erhalten)
+- `v5.0.0`: Initiales Release — Filme/Serien/Ordner-Modi, Simulationsmodus, Rollback, NFO-Update
+
+---
+
+## Drittanbieter-Komponenten
+
+| Komponente | Autor | Lizenz | Verwendung |
+|---|---|---|---|
+| [dovi_tool](https://github.com/quietvoid/dovi_tool) | quietvoid | GPL v3.0 or later | DV-Profil-5 → Profil-8-Konvertierung |
+
+dovi_tool ist **nicht im Repository enthalten**. Download: <https://github.com/quietvoid/dovi_tool/releases>
 
 ---
 

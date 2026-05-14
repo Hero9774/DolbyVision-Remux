@@ -1,5 +1,5 @@
 """
-dv_remux_gui.py  v5.0.3
+dv_remux_gui.py  v5.5.0
 =======================
 GUI-Tool: Dolby Vision MKV → MP4 Remux + SRT Untertitel-Extraktion
 Für Jellyfin / LG TV
@@ -27,6 +27,16 @@ Neu in v5.0.3:
   • Hint-Texte anonymisiert (kein echter Filmname als Beispiel).
   • Sekundär-Buttons einheitlich größer.
 
+Neu in v5.3.0:
+  • dvcC-Box (Dolby Vision Configuration Record) direkt in die MP4 injiziert:
+    Ohne dvcC erkennt Jellyfin / LG TV kein Dolby Vision im MP4-Container.
+    Die Box wird nach dem Mux per Python-Binärpatch eingefügt (keine faststart-
+    Verschiebung nötig, da moov am Dateiende liegt). ffprobe zeigt danach:
+    dv_profile=8, dv_level=<auto>, dv_bl_signal_compatibility_id=1
+  • 5-Schritt-Pipeline für P5→P8: [1/5] HEVC, [2/5] dovi_tool P5→P8,
+    [3/5] MP4 (kein faststart), [4/5] dvcC injizieren, [5/5] faststart + mp42
+  • Duplikate bei Untertiteln werden übersprungen (SKIP-Eintrag im Log)
+
 Neu in v5.2.0:
   • DV Profil 5 → Profil 8 Konvertierung via dovi_tool (tools/dovi_tool.exe):
     Profil-5-MKVs (ICtCp/IPT-PQ-C2, typisch bei WEB-DL-Releases) verursachen
@@ -49,8 +59,10 @@ Voraussetzungen:
 import os
 import sys
 import json
+import time
 import queue
 import shutil
+import struct
 import tempfile
 import threading
 import subprocess
@@ -65,11 +77,16 @@ from datetime import datetime
 #  KONSTANTEN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "5.2.0"
-CONFIG_DATEI = Path(__file__).parent / "dv_remux_config.json"
-LOG_ORDNER   = Path(__file__).parent / "logs"
-TEXT_CODECS  = {"subrip", "ass", "ssa", "webvtt", "mov_text", "text", "srt"}
-DOVI_TOOL    = Path(__file__).parent / "tools" / "dovi_tool.exe"
+VERSION      = "5.5.0"
+CONFIG_ORDNER = Path(__file__).parent / "config"
+CONFIG_DATEI  = CONFIG_ORDNER / "dv_remux_config.json"
+LOG_ORDNER    = Path(__file__).parent / "logs"
+TEXT_CODECS   = {"subrip", "ass", "ssa", "webvtt", "mov_text", "text", "srt"}
+DOVI_TOOL     = Path(__file__).parent / "tools" / "dovi_tool.exe"
+
+# Ordnerstruktur beim Start sicherstellen
+for _d in (CONFIG_ORDNER, LOG_ORDNER, DOVI_TOOL.parent):
+    _d.mkdir(parents=True, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  EINSTELLUNGEN
@@ -250,11 +267,35 @@ def ermittle_dv_profil(ffprobe: Path, mkv_pfad: Path) -> tuple:
     Gibt (dv_profil: int|None, farb_matrix: str|None) zurück.
     DV Profil 5 + ICtCp (IPT-PQ-C2) verursacht auf Geräten ohne nativen
     Dolby-Vision-Decoder einen typischen Farb-/Blaustich-Fehler.
+
+    Erkennungs-Strategie (in Reihenfolge):
+      1. Stream-Level side_data: dv_profile direkt
+      2. Stream-Level side_data: dv_bl_signal_compatibility_id == 0 → Profil 5
+         (compatibility_id 0 = kein HDR10-Fallback = typisch Profil 5 / ICtCp)
+      3. Frame-Level-Fallback (wie ermittle_hdrtype_aus_mkv) für ältere ffprobe
     """
     befehl = [
         str(ffprobe), "-v", "quiet", "-print_format", "json",
         "-show_streams", "-select_streams", "v:0", str(mkv_pfad)
     ]
+
+    def _parse_dovi_entry(entry: dict) -> int | None:
+        """Gibt dv_profil aus einem DOVI-side_data-Eintrag zurück oder None."""
+        if "dv_profile" in entry:
+            try:
+                return int(entry["dv_profile"])
+            except (ValueError, TypeError):
+                pass
+        # dv_bl_signal_compatibility_id 0 = kein BL-Signal-Compatibility
+        # → typisch für DV Profil 5 (ICtCp, kein HDR10-Fallback)
+        if "dv_bl_signal_compatibility_id" in entry:
+            try:
+                if int(entry["dv_bl_signal_compatibility_id"]) == 0:
+                    return 5
+            except (ValueError, TypeError):
+                pass
+        return None
+
     try:
         erg = subprocess.run(befehl, capture_output=True, text=True,
                              encoding="utf-8", errors="replace",
@@ -265,19 +306,319 @@ def ermittle_dv_profil(ffprobe: Path, mkv_pfad: Path) -> tuple:
             return None, None
         stream = streams[0]
 
+        # Schritt 1+2: Stream-Level side_data
         dv_profil = None
         for entry in stream.get("side_data_list", []):
-            if "dv_profile" in entry:
-                try:
-                    dv_profil = int(entry["dv_profile"])
-                except (ValueError, TypeError):
-                    pass
+            typ = str(entry.get("side_data_type", "")).upper()
+            if "DOVI" not in typ and "DOLBY" not in typ:
+                continue
+            dv_profil = _parse_dovi_entry(entry)
+            if dv_profil is not None:
                 break
 
-        farb_matrix = stream.get("color_space") or stream.get("color_primaries")
+        # Schritt 3: Frame-Level-Fallback wenn Stream-Level kein Ergebnis
+        if dv_profil is None:
+            befehl_f = [
+                str(ffprobe), "-v", "quiet", "-print_format", "json",
+                "-read_intervals", "%+#1",
+                "-show_frames", "-select_streams", "v:0", str(mkv_pfad)
+            ]
+            erg_f = subprocess.run(befehl_f, capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=30)
+            if erg_f.returncode == 0:
+                for frame in json.loads(erg_f.stdout).get("frames", []):
+                    for entry in frame.get("side_data_list", []):
+                        typ = str(entry.get("side_data_type", "")).upper()
+                        if "DOVI" not in typ and "DOLBY" not in typ:
+                            continue
+                        dv_profil = _parse_dovi_entry(entry)
+                        if dv_profil is not None:
+                            break
+                    if dv_profil is not None:
+                        break
+
+        # Farbmatrix: alle relevanten Stream-Felder abfragen
+        farb_matrix = (stream.get("color_space")
+                       or stream.get("color_primaries")
+                       or stream.get("color_transfer"))
         return dv_profil, farb_matrix
     except Exception:
         return None, None
+
+
+def _berechne_dv_level(breite: int, hoehe: int, fps: float) -> int:
+    """Bestimmt den DV-Level aus Videoauflösung und Bildrate (für dvcC-Box)."""
+    px = breite * hoehe
+    if px <= 1280 * 720:
+        return 2 if fps > 24.5 else 1
+    if px <= 1920 * 1080:
+        if fps <= 24.5: return 3
+        if fps <= 30.5: return 5
+        return 6
+    if px <= 2048 * 1080:
+        return 7 if fps > 24.5 else 4
+    if px <= 3840 * 2160:
+        if fps <= 24.5: return 6
+        if fps <= 30.5: return 8
+        return 9
+    return 9
+
+
+def injiziere_dvcc_box(mp4_pfad: Path, dv_profil: int = 8,
+                        dv_level: int = 6, compat_id: int = 1) -> bool:
+    """
+    Injiziert eine dvcC-Box (Dolby Vision Configuration Record) in eine MP4-Datei.
+    Voraussetzung: moov am Ende der Datei (kein faststart-Modus).
+    Navigiert moov→trak→mdia→minf→stbl→stsd→(dvh1/hvc1) und fügt dvcC nach
+    hvcC ein. Aktualisiert nur die betroffenen Parent-Box-Größen; stco/co64
+    bleiben unberührt (mdat liegt vor moov).
+    """
+    # 16-Byte dvcC aufbauen
+    # Bit-Layout (48 Bit): profile(7)+level(6)+rpu(1)+el(1)+bl(1)+compat(4)+reserved(28)
+    bits = dv_profil & 0x7F
+    bits = (bits << 6) | (dv_level & 0x3F)
+    bits = (bits << 3) | 0b101          # rpu=1, el=0, bl=1
+    bits = (bits << 4) | (compat_id & 0xF)
+    bits <<= 28                          # 28 reservierte Bits → 48 Bit gesamt
+    dvcc = struct.pack(">I4sBB", 16, b"dvcC", 1, 0) + bits.to_bytes(6, "big")
+
+    try:
+        with open(mp4_pfad, "r+b") as f:
+            datei_sz = f.seek(0, 2)
+            f.seek(0)
+
+            moov_off = moov_sz = None
+            pos = 0
+            while pos < datei_sz:
+                f.seek(pos)
+                kopf = f.read(8)
+                if len(kopf) < 8:
+                    break
+                sz = struct.unpack(">I", kopf[:4])[0]
+                typ = kopf[4:8]
+                if sz == 1:
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        break
+                    sz = struct.unpack(">Q", ext)[0]
+                elif sz == 0:
+                    sz = datei_sz - pos
+                if sz < 8:
+                    break
+                if typ == b"moov":
+                    moov_off, moov_sz = pos, sz
+                pos += sz
+
+            if moov_off is None:
+                return False
+
+            f.seek(moov_off)
+            moov = bytearray(f.read(moov_sz))
+
+        CONTAINER = {b"trak", b"mdia", b"minf", b"stbl", b"stsd"}
+        HEVC_ENTRY = {b"dvh1", b"hvc1", b"dvhe", b"hev1"}
+        n = len(moov)
+
+        def _box(data, pos, ende):
+            if pos + 8 > ende:
+                return None
+            sz = struct.unpack_from(">I", data, pos)[0]
+            hdr = 8
+            if sz == 1:
+                if pos + 16 > ende:
+                    return None
+                sz = struct.unpack_from(">Q", data, pos + 8)[0]
+                hdr = 16
+            elif sz == 0:
+                sz = ende - pos
+            return pos, sz, bytes(data[pos + 4:pos + 8]), pos + hdr
+
+        def _kinder(data, start, ende):
+            p = start
+            while p + 8 <= ende:
+                b = _box(data, p, ende)
+                if not b or b[1] < 8:
+                    break
+                yield b
+                p += b[1]
+
+        def _suche(data, start, ende):
+            for off, sz, typ, ds in _kinder(data, start, ende):
+                if typ in CONTAINER:
+                    # stsd ist eine FullBox: 8 Byte extra (version+flags+entry_count)
+                    kind_start = ds + (8 if typ == b"stsd" else 0)
+                    pos_ins, eltern = _suche(data, kind_start, off + sz)
+                    if pos_ins is not None:
+                        return pos_ins, [off] + eltern
+                elif typ in HEVC_ENTRY:
+                    # hvcC per Signatur finden (VisualSampleEntry-Länge
+                    # variiert je nach ffmpeg-Version → kein fixer Offset)
+                    eintrag = bytes(data[ds:off + sz])
+                    hvcc_rel = eintrag.find(b"hvcC")
+                    if hvcc_rel >= 4:
+                        hvcc_abs = ds + hvcc_rel - 4
+                        hvcc_sz  = struct.unpack_from(">I", data, hvcc_abs)[0]
+                        hat_dvcc = b"dvcC" in eintrag[hvcc_rel + hvcc_sz - 4:]
+                        if 8 <= hvcc_sz <= (off + sz - hvcc_abs) and not hat_dvcc:
+                            return hvcc_abs + hvcc_sz, [off]
+            return None, []
+
+        einfuege_pos, groessen_offs = _suche(moov, 8, n)
+        if einfuege_pos is None:
+            return False
+
+        moov[einfuege_pos:einfuege_pos] = dvcc
+
+        for soff in [0] + groessen_offs:
+            alt = struct.unpack_from(">I", moov, soff)[0]
+            struct.pack_into(">I", moov, soff, alt + 16)
+
+        with open(mp4_pfad, "r+b") as f:
+            f.seek(moov_off)
+            f.write(moov)
+            f.truncate(moov_off + len(moov))
+
+        return True
+    except Exception:
+        return False
+
+
+def _update_stco_co64(moov: bytearray, delta: int) -> None:
+    """Addiert delta zu allen stco/co64-Chunk-Offsets im moov-Bytearray."""
+    CONTAINER = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
+    n = len(moov)
+
+    def _visit(start: int, end: int) -> None:
+        pos = start
+        while pos + 8 <= end:
+            bsz = struct.unpack_from(">I", moov, pos)[0]
+            btyp = bytes(moov[pos + 4:pos + 8])
+            hdr = 8
+            if bsz == 1:
+                if pos + 16 > end:
+                    break
+                bsz = struct.unpack_from(">Q", moov, pos + 8)[0]
+                hdr = 16
+            elif bsz == 0:
+                bsz = end - pos
+            if bsz < 8 or pos + bsz > end:
+                break
+            if btyp in CONTAINER:
+                _visit(pos + hdr, pos + bsz)
+            elif btyp == b"stco":
+                # FullBox: version(1)+flags(3)+count(4) = 8 Byte vor Offsets
+                count = struct.unpack_from(">I", moov, pos + hdr + 4)[0]
+                off = pos + hdr + 8
+                for _ in range(count):
+                    old = struct.unpack_from(">I", moov, off)[0]
+                    struct.pack_into(">I", moov, off, old + delta)
+                    off += 4
+            elif btyp == b"co64":
+                count = struct.unpack_from(">I", moov, pos + hdr + 4)[0]
+                off = pos + hdr + 8
+                for _ in range(count):
+                    old = struct.unpack_from(">Q", moov, off)[0]
+                    struct.pack_into(">Q", moov, off, old + delta)
+                    off += 8
+            pos += bsz
+
+    _visit(0, n)
+
+
+def mache_faststart_und_ftyp(mp4_pfad: Path) -> bool:
+    """
+    Verschiebt moov vor mdat (faststart) und setzt major_brand auf mp42.
+    Schreibt eine neue Datei (30-GB-Copy) — benötigt freien Speicherplatz.
+    Gibt True zurück wenn erfolgreich oder moov bereits an erster Stelle.
+    """
+    BUF = 64 * 1024 * 1024  # 64 MB Lesepuffer
+
+    try:
+        with open(mp4_pfad, "rb") as f:
+            total_sz = f.seek(0, 2)
+            f.seek(0)
+
+            # Top-Level-Boxen ermitteln
+            ftyp_off = ftyp_sz = None
+            mdat_off = mdat_sz = mdat_hdr = None
+            moov_off = moov_sz = None
+            pos = 0
+            while pos < total_sz:
+                f.seek(pos)
+                h = f.read(8)
+                if len(h) < 8:
+                    break
+                bsz = struct.unpack(">I", h[:4])[0]
+                btyp = h[4:8]
+                hdr = 8
+                if bsz == 1:
+                    ext = f.read(8)
+                    bsz = struct.unpack(">Q", ext)[0]
+                    hdr = 16
+                elif bsz == 0:
+                    bsz = total_sz - pos
+                if bsz < 8:
+                    break
+                if btyp == b"ftyp":
+                    ftyp_off, ftyp_sz = pos, bsz
+                elif btyp == b"mdat":
+                    mdat_off, mdat_sz, mdat_hdr = pos, bsz, hdr
+                elif btyp == b"moov":
+                    moov_off, moov_sz = pos, bsz
+                pos += bsz
+
+            if None in (ftyp_off, mdat_off, moov_off):
+                return False
+            if moov_off < mdat_off:
+                return True  # Bereits faststart
+
+            # ftyp laden und major_brand auf mp42 patchen
+            f.seek(ftyp_off)
+            ftyp_data = bytearray(f.read(ftyp_sz))
+            ftyp_data[8:12] = b"mp42"
+            compat = [bytes(ftyp_data[i:i + 4]) for i in range(16, ftyp_sz, 4)]
+            if b"mp42" not in compat:
+                ftyp_data += b"mp42"
+                struct.pack_into(">I", ftyp_data, 0, ftyp_sz + 4)
+                new_ftyp_sz = ftyp_sz + 4
+            else:
+                new_ftyp_sz = ftyp_sz
+
+            # moov laden
+            f.seek(moov_off)
+            moov_data = bytearray(f.read(moov_sz))
+
+        # stco/co64 anpassen:
+        # Alt: mdat-Daten bei mdat_off + mdat_hdr
+        # Neu: mdat-Daten bei new_ftyp_sz + moov_sz + mdat_hdr
+        old_data_off = mdat_off + mdat_hdr
+        new_data_off = new_ftyp_sz + moov_sz + mdat_hdr
+        _update_stco_co64(moov_data, new_data_off - old_data_off)
+
+        tmp_pfad = mp4_pfad.with_name(mp4_pfad.stem + "._fstmp.mp4")
+        try:
+            with open(mp4_pfad, "rb") as fin, open(tmp_pfad, "wb") as fout:
+                fout.write(ftyp_data)
+                fout.write(moov_data)
+                fin.seek(mdat_off)
+                verbleibend = mdat_sz
+                while verbleibend > 0:
+                    chunk = fin.read(min(verbleibend, BUF))
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+                    verbleibend -= len(chunk)
+
+            mp4_pfad.unlink()
+            tmp_pfad.rename(mp4_pfad)
+            return True
+        except Exception:
+            if tmp_pfad.exists():
+                tmp_pfad.unlink(missing_ok=True)
+            raise
+
+    except Exception:
+        return False
 
 
 def konvertiere_dv_p5_zu_p8(
@@ -287,14 +628,15 @@ def konvertiere_dv_p5_zu_p8(
         simulation: bool, log_zeilen: list,
         stopp_event=None) -> bool:
     """
-    DV Profil 5 (ICtCp) → Profil 8 (HDR10-kompatibel) ohne Re-Encoding:
+    DV Profil 5 (ICtCp) → Profil 8.1 (HDR10-kompatibel) ohne Re-Encoding:
       Schritt 1: HEVC-Stream extrahieren (ffmpeg -c:v copy)
-      Schritt 2: RPU konvertieren P5→P8 (dovi_tool -m 2 convert --discard)
-      Schritt 3: MP4 zusammensetzen (P8-HEVC + Audio aus Original-MKV)
+      Schritt 2: RPU konvertieren P5→P8.1 (dovi_tool -m 3 convert)
+      Schritt 3: MP4 zusammensetzen (P8-HEVC + Audio aus Original-MKV, kein faststart)
+      Schritt 4: dvcC-Box injizieren (Dolby Vision Configuration Record)
+      Schritt 5: faststart – moov vor mdat schieben, major_brand mp42
     Temp-Dateien werden in jedem Fall bereinigt (auch bei Fehler).
     """
     if simulation:
-        import time
         msg = (f"  [SIM] P5->P8-Konvertierung wuerde stattfinden:\n"
                f"    {mkv_pfad.name}\n    -> {mp4_pfad.name}")
         log_q.put(("SIM",
@@ -321,9 +663,9 @@ def konvertiere_dv_p5_zu_p8(
     proc = None
     try:
         # ── Schritt 1: HEVC extrahieren ────────────────────────────────────
-        task_q.put({"schritt": "P5→P8 [1/3]: HEVC extrahieren …", "sub_prog": 0})
-        log_q.put(("INFO", "  🔬  [1/3] HEVC-Stream extrahieren …"))
-        log_zeilen.append("  [1/3] HEVC extrahieren")
+        task_q.put({"schritt": "P5→P8 [1/5]: HEVC extrahieren …", "sub_prog": 0})
+        log_q.put(("INFO", "  🔬  [1/5] HEVC-Stream extrahieren …"))
+        log_zeilen.append("  [1/5] HEVC extrahieren")
 
         befehl1 = [str(ffmpeg), "-i", str(mkv_pfad),
                    "-c:v", "copy", "-an", "-sn", "-y", str(tmp_hevc)]
@@ -356,19 +698,19 @@ def konvertiere_dv_p5_zu_p8(
                     pass
         proc.wait()
         if proc.returncode != 0:
-            log_q.put(("ERR", "  ❌ [1/3] HEVC-Extraktion fehlgeschlagen."))
+            log_q.put(("ERR", "  ❌ [1/5] HEVC-Extraktion fehlgeschlagen."))
             log_zeilen.append("  FEHLER: HEVC-Extraktion")
             cleanup(); return False
-        task_q.put({"sub_prog": 33})
+        task_q.put({"sub_prog": 25})
         log_q.put(("OK", "     ✅ HEVC extrahiert"))
         log_zeilen.append("     OK: HEVC extrahiert")
 
-        # ── Schritt 2: RPU P5 → P8 konvertieren ───────────────────────────
-        task_q.put({"schritt": "P5→P8 [2/3]: RPU konvertieren …", "sub_prog": 33})
-        log_q.put(("INFO", "  🔬  [2/3] RPU Profil 5 → 8 (dovi_tool) …"))
-        log_zeilen.append("  [2/3] dovi_tool P5->P8")
+        # ── Schritt 2: RPU P5 → P8.1 konvertieren ─────────────────────────
+        task_q.put({"schritt": "P5→P8 [2/5]: RPU konvertieren …", "sub_prog": 25})
+        log_q.put(("INFO", "  🔬  [2/5] RPU Profil 5 → 8.1 (dovi_tool) …"))
+        log_zeilen.append("  [2/5] dovi_tool P5->P8")
 
-        befehl2 = [str(dovi_tool), "-m", "2", "convert", "--discard",
+        befehl2 = [str(dovi_tool), "-m", "3", "convert",
                    str(tmp_hevc), "-o", str(tmp_hevc_p8)]
         erg2 = subprocess.run(befehl2, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=600)
@@ -377,14 +719,30 @@ def konvertiere_dv_p5_zu_p8(
             log_q.put(("ERR", f"  ❌ dovi_tool Fehler (Code {erg2.returncode}):\n     {fehler}"))
             log_zeilen.append(f"  FEHLER: dovi_tool Code {erg2.returncode}: {fehler}")
             cleanup(); return False
-        task_q.put({"sub_prog": 66})
-        log_q.put(("OK", "     ✅ RPU zu Profil 8 konvertiert"))
+        task_q.put({"sub_prog": 50})
+        log_q.put(("OK", "     ✅ RPU zu Profil 8.1 konvertiert"))
         log_zeilen.append("     OK: RPU Profil 8")
 
-        # ── Schritt 3: MP4 zusammensetzen ─────────────────────────────────
-        task_q.put({"schritt": "P5→P8 [3/3]: MP4 zusammensetzen …", "sub_prog": 66})
-        log_q.put(("INFO", f"  🔬  [3/3] MP4 zusammensetzen → {mp4_pfad.name}"))
-        log_zeilen.append(f"  [3/3] MP4 zusammensetzen: {mp4_pfad.name}")
+        # DV-Level für dvcC-Box aus Streaminfo bestimmen
+        dv_level = 6
+        try:
+            s_info = json.loads(subprocess.run(
+                [str(ffprobe), "-v", "quiet", "-print_format", "json",
+                 "-show_streams", "-select_streams", "v:0", str(mkv_pfad)],
+                capture_output=True, text=True, timeout=30).stdout
+            ).get("streams", [{}])[0]
+            breite  = int(s_info.get("width",  3840))
+            hoehe   = int(s_info.get("height", 2160))
+            fps_raw = s_info.get("r_frame_rate", "24/1")
+            fps_n, fps_d = (int(x) for x in fps_raw.split("/")) if "/" in fps_raw else (24, 1)
+            dv_level = _berechne_dv_level(breite, hoehe, fps_n / max(fps_d, 1))
+        except Exception:
+            pass
+
+        # ── Schritt 3: MP4 zusammensetzen (ohne faststart) ────────────────
+        task_q.put({"schritt": "P5→P8 [3/5]: MP4 zusammensetzen …", "sub_prog": 50})
+        log_q.put(("INFO", f"  🔬  [3/5] MP4 zusammensetzen → {mp4_pfad.name}"))
+        log_zeilen.append(f"  [3/5] MP4 zusammensetzen: {mp4_pfad.name}")
 
         # Audio: alle kompatiblen Spuren aus Original-MKV (TrueHD ausschließen)
         alle_audio = ermittle_audio_streams(ffprobe, mkv_pfad)
@@ -399,12 +757,14 @@ def konvertiere_dv_p5_zu_p8(
         for idx in audio_indizes:
             audio_maps += ["-map", f"1:{idx}"]
 
+        # Kein -movflags +faststart: moov landet am Ende → dvcC-Injektion
+        # (Schritt 4) kann Box-Offsets unverändert lassen
         befehl3 = ([str(ffmpeg),
                     "-i", str(tmp_hevc_p8),
                     "-i", str(mkv_pfad)]
                    + ["-map", "0:v:0"] + audio_maps
                    + ["-c", "copy", "-strict", "unofficial",
-                      "-tag:v", "hvc1", "-movflags", "+faststart",
+                      "-tag:v", "dvh1",
                       "-y", str(mp4_pfad)])
 
         proc = subprocess.Popen(befehl3, stderr=subprocess.PIPE,
@@ -433,25 +793,46 @@ def konvertiere_dv_p5_zu_p8(
                     h, m, s = zeit_str.split(":")
                     vergangen = int(h)*3600 + int(m)*60 + float(s)
                     if dauer_sek and dauer_sek > 0:
-                        pct = 66 + min(int(vergangen / dauer_sek * 34), 33)
+                        pct = 50 + min(int(vergangen / dauer_sek * 45), 44)
                         task_q.put({"sub_prog": pct})
                 except Exception:
                     pass
                 log_q.put(("PROG", f"     {zeile}"))
         proc.wait()
-        if proc.returncode == 0:
-            task_q.put({"sub_prog": 100})
-            log_q.put(("OK", "     ✅ MP4 fertig (DV Profil 8 – HDR10-kompatibel)"))
-            log_zeilen.append("     OK: MP4 fertig (DV Profil 8)")
-            return True
-        else:
+        if proc.returncode != 0:
             for z in stderr_z3[-15:]:
                 if z.strip():
                     log_q.put(("ERR", f"     {z}"))
                     log_zeilen.append(f"     {z}")
-            log_q.put(("ERR", "  ❌ [3/3] MP4-Zusammensetzen fehlgeschlagen."))
+            log_q.put(("ERR", "  ❌ [3/5] MP4-Zusammensetzen fehlgeschlagen."))
             log_zeilen.append("  FEHLER: MP4-Zusammensetzen")
             return False
+
+        # ── Schritt 4: dvcC-Box injizieren ────────────────────────────────
+        task_q.put({"schritt": "P5→P8 [4/5]: dvcC-Box injizieren …", "sub_prog": 93})
+        log_q.put(("INFO", f"  🔬  [4/5] dvcC-Box (Profil 8.1, Level {dv_level}) injizieren …"))
+        log_zeilen.append("  [4/5] dvcC-Box injizieren")
+        if not injiziere_dvcc_box(mp4_pfad, dv_profil=8, dv_level=dv_level, compat_id=1):
+            log_q.put(("ERR", "  ❌ [4/5] dvcC-Box konnte nicht injiziert werden."))
+            log_zeilen.append("  FEHLER: dvcC-Injektion")
+            return False
+        log_q.put(("OK", "     ✅ dvcC-Box gesetzt (DV Profil 8.1, HDR10-kompatibel)"))
+        log_zeilen.append("     OK: dvcC gesetzt")
+
+        # ── Schritt 5: faststart – moov vor mdat schieben ─────────────────
+        task_q.put({"schritt": "P5→P8 [5/5]: faststart (moov → Dateianfang) …", "sub_prog": 96})
+        log_q.put(("INFO", "  🔬  [5/5] faststart: moov vor mdat verschieben …"))
+        log_zeilen.append("  [5/5] faststart")
+        if mache_faststart_und_ftyp(mp4_pfad):
+            task_q.put({"sub_prog": 100})
+            log_q.put(("OK", "     ✅ MP4 fertig (DV P8.1, dvcC, faststart, mp42)"))
+            log_zeilen.append("     OK: MP4 fertig (DV Profil 8)")
+            return True
+        else:
+            # faststart-Fehler ist nicht fatal — dvcC ist bereits gesetzt
+            log_q.put(("WARN", "  ⚠  [5/5] faststart fehlgeschlagen (kein freier Speicher?). MP4 trotzdem nutzbar."))
+            log_zeilen.append("  WARNUNG: faststart fehlgeschlagen")
+            return True
 
     except Exception as e:
         log_q.put(("ERR", f"  ❌ P5→P8-Fehler: {e}"))
@@ -489,10 +870,11 @@ def extrahiere_untertitel(ffmpeg: Path, mkv_pfad: Path, streams: list,
         sprache = stream["language"]
         idx     = stream["index"]
         sprachzähler[sprache] = sprachzähler.get(sprache, 0) + 1
-        suffix = f".{sprache}"
         if sprachzähler[sprache] > 1:
-            suffix += f".{sprachzähler[sprache]}"
-        srt_pfad = basis.parent / (basis.name + suffix + ".srt")
+            log_q.put(("SKIP", f"  ⚠  Duplikat [{sprache}] Spur #{idx} übersprungen"))
+            log_zeilen.append(f"  SKIP: Duplikat [{sprache}] Spur #{idx} uebersprungen")
+            continue
+        srt_pfad = basis.parent / (basis.name + f".{sprache}.srt")
 
         task_q.put({
             "schritt":  f"SRT: {srt_pfad.name}",
@@ -716,19 +1098,78 @@ def aktualisiere_nfo(
 
     task_q.put({"schritt": "NFO aktualisiert", "sub_prog": 100})
 
+def _dvcc_vorhanden(mp4_pfad: Path) -> bool:
+    """Prüft ob eine dvcC-Box in der MP4-Datei vorhanden ist (schnelle Byte-Suche im moov)."""
+    try:
+        with open(mp4_pfad, "rb") as f:
+            total = f.seek(0, 2); f.seek(0)
+            pos = 0
+            while pos < total:
+                f.seek(pos)
+                h = f.read(8)
+                if len(h) < 8: break
+                bsz = struct.unpack(">I", h[:4])[0]
+                btyp = h[4:8]
+                hdr = 8
+                if bsz == 1:
+                    ext = f.read(8); bsz = struct.unpack(">Q", ext)[0]; hdr = 16
+                elif bsz == 0: bsz = total - pos
+                if bsz < 8: break
+                if btyp == b"moov":
+                    daten = f.read(bsz - hdr)
+                    return b"dvcC" in daten
+                pos += bsz
+    except Exception:
+        pass
+    return False
+
+
+def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,
+                          log_zeilen: list, simulation: bool) -> None:
+    """
+    Nach normalem DV-Remux (ohne faststart): dvcC prüfen/injizieren,
+    dann moov nach vorne schieben (faststart) und ftyp auf mp42 setzen.
+    """
+    if simulation:
+        return
+    hat_dvcc = _dvcc_vorhanden(mp4_pfad)
+    if not hat_dvcc:
+        log_q.put(("INFO", "  🔬  dvcC-Box fehlt – wird injiziert …"))
+        log_zeilen.append("  dvcC-Box injizieren")
+        if injiziere_dvcc_box(mp4_pfad):
+            log_q.put(("OK", "     ✅ dvcC-Box gesetzt"))
+            log_zeilen.append("     OK: dvcC gesetzt")
+        else:
+            log_q.put(("WARN", "  ⚠  dvcC-Injektion fehlgeschlagen"))
+            log_zeilen.append("  WARNUNG: dvcC-Injektion fehlgeschlagen")
+    else:
+        log_q.put(("INFO", "  ✅ dvcC-Box bereits vorhanden"))
+        log_zeilen.append("  dvcC: bereits vorhanden")
+
+    log_q.put(("INFO", "  🔬  faststart: moov → Dateianfang, mp42 …"))
+    log_zeilen.append("  faststart + mp42")
+    if mache_faststart_und_ftyp(mp4_pfad):
+        log_q.put(("OK", "     ✅ faststart OK (mp42)"))
+        log_zeilen.append("     OK: faststart mp42")
+    else:
+        log_q.put(("WARN", "  ⚠  faststart fehlgeschlagen (MP4 trotzdem nutzbar)"))
+        log_zeilen.append("  WARNUNG: faststart fehlgeschlagen")
+
+
 def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
                  log_q: queue.Queue, task_q: queue.Queue,
                  simulation: bool, log_zeilen: list,
                  stopp_event=None, text_sub_indices=None,
                  ffprobe_pfad: Path = None,
-                 audio_indices: list = None) -> bool:
+                 audio_indices: list = None,
+                 kein_faststart: bool = False) -> bool:
     """Remux MKV -> MP4 ohne Re-Encoding.
     text_sub_indices: Stream-Indizes für Text-Untertitel → mov_text einbetten.
     audio_indices: Explizite Audio-Stream-Indizes (None = alle via -map 0:a).
     ffprobe_pfad: Wird für TrueHD-Retry benötigt.
+    kein_faststart: True = kein -movflags +faststart (für nachgelagerte dvcC-Injektion).
     """
     if simulation:
-        import time
         embed_info = (f" + {len(text_sub_indices)} Sub(s)" if text_sub_indices else "")
         msg = (f"  [SIM] Remux wuerde stattfinden:\n"
                f"    {mkv_pfad.name}\n    -> {mp4_pfad.name}{embed_info}")
@@ -750,20 +1191,21 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
         audio_maps = ["-map", "0:a"]
 
     # Kommando aufbauen – 0:v:0 = nur Haupt-Videostream (kein MJPEG-Cover)
+    fs_flags = [] if kein_faststart else ["-movflags", "+faststart"]
     if text_sub_indices:
         # Video + Audio + ausgewählte Text-Untertitel (→ mov_text)
         befehl = [str(ffmpeg), "-i", str(mkv_pfad), "-map", "0:v:0"] + audio_maps
         for idx in text_sub_indices:
             befehl += ["-map", f"0:{idx}"]
-        befehl += ["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
-                   "-strict", "unofficial", "-tag:v", "hvc1",
-                   "-movflags", "+faststart", "-y", str(mp4_pfad)]
+        befehl += (["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
+                    "-strict", "unofficial", "-tag:v", "hvc1"]
+                   + fs_flags + ["-y", str(mp4_pfad)])
     else:
         # Nur Haupt-Video + Audio mappen
         befehl = ([str(ffmpeg), "-i", str(mkv_pfad), "-map", "0:v:0"]
                   + audio_maps
-                  + ["-c", "copy", "-strict", "unofficial", "-tag:v", "hvc1",
-                     "-movflags", "+faststart", "-y", str(mp4_pfad)])
+                  + ["-c", "copy", "-strict", "unofficial", "-tag:v", "hvc1"]
+                  + fs_flags + ["-y", str(mp4_pfad)])
 
     msg = f"  Remux: {mkv_pfad.name} -> {mp4_pfad.name}"
     log_q.put(("INFO", f"  ▶  Remux: {mkv_pfad.name} → {mp4_pfad.name}"))
@@ -832,7 +1274,8 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
                                     stopp_event=stopp_event,
                                     text_sub_indices=None,
                                     ffprobe_pfad=ffprobe_pfad,
-                                    audio_indices=audio_indices)
+                                    audio_indices=audio_indices,
+                                    kein_faststart=kein_faststart)
 
             # TrueHD ist im MP4-Container experimentell und von LG TV / Jellyfin
             # nicht unterstützt. Bei entsprechendem ffmpeg-Fehler: Audio-Streams
@@ -853,7 +1296,8 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
                                         stopp_event=stopp_event,
                                         text_sub_indices=text_sub_indices,
                                         ffprobe_pfad=ffprobe_pfad,
-                                        audio_indices=kompatibel)
+                                        audio_indices=kompatibel,
+                                        kein_faststart=kein_faststart)
 
             # Return-Code: unsigned → signed für lesbare Anzeige (Windows)
             rc = proc.returncode
@@ -880,12 +1324,12 @@ def schreibe_log_datei(log_zeilen: list, simulation: bool) -> Path:
     """Log-Datei im logs/-Ordner speichern."""
     try:
         LOG_ORDNER.mkdir(exist_ok=True)
-        ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts    = datetime.now()
         modus = "SIM" if simulation else "RUN"
-        pfad  = LOG_ORDNER / f"dv_remux_{modus}_{ts}.log"
+        pfad  = LOG_ORDNER / f"dv_remux_{modus}_{ts.strftime('%Y%m%d_%H%M%S')}.log"
         kopf  = [
             f"DV Remux Tool v{VERSION}",
-            f"Datum:  {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
+            f"Datum:  {ts.strftime('%d.%m.%Y %H:%M:%S')}",
             f"Modus:  {'SIMULATION' if simulation else 'ECHTLAUF'}",
             "=" * 55, ""
         ]
@@ -1096,7 +1540,8 @@ def verarbeite_serien(
                 # DV-Profil-Prüfung: Profil 5 (ICtCp) → P5→P8-Konvertierung oder Warnung
                 braucht_p5_fix = False
                 dv_profil, farb_matrix = ermittle_dv_profil(ffprobe, mkv_pfad)
-                _ictcp = farb_matrix and "ictcp" in str(farb_matrix).lower()
+                _ictcp = farb_matrix and any(kw in str(farb_matrix).lower()
+                                    for kw in ("ictcp", "ipt-pq", "ipt_pq"))
                 if dv_profil == 5 or _ictcp:
                     braucht_p5_fix = True
                     if DOVI_TOOL.exists():
@@ -1134,7 +1579,7 @@ def verarbeite_serien(
                 # Remux (normaler Pfad) oder P5→P8-Konvertierung
                 neu_remuxed = False
                 if mp4_pfad.exists():
-                    log("SKIP", f"    ✅ MP4 bereits vorhanden – übersprungen.")
+                    log("SKIP", "    ✅ MP4 bereits vorhanden – übersprungen.")
                     stats["uebersprungen"] += 1
                     task_q.put({"schritt": "MP4 bereits vorhanden", "sub_prog": 100})
                 else:
@@ -1151,11 +1596,13 @@ def verarbeite_serien(
                             ffmpeg, mkv_pfad, mp4_pfad,
                             log_q, task_q, simulation, log_zeilen,
                             stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                            ffprobe_pfad=ffprobe)
+                            ffprobe_pfad=ffprobe, kein_faststart=True)
+                        if erfolg:
+                            nachbearbeite_dv_mp4(mp4_pfad, log_q, log_zeilen, simulation)
                     if erfolg:
                         stats["remuxed"] += 1
                         neu_remuxed = True
-                        log("OK", f"    ✅ Remux erfolgreich!")
+                        log("OK", "    ✅ Remux erfolgreich!")
                         task_q.put({"schritt": "Remux abgeschlossen", "sub_prog": 100})
                         if not simulation:
                             undo_log.append({"typ": "mp4", "pfad": mp4_pfad})
@@ -1194,7 +1641,7 @@ def verarbeite_serien(
                     aktualisiere_nfo(nfo_pfad, mp4_pfad, erstellte_srts, log_q, task_q,
                                      simulation, log_zeilen, undo_log=undo_log)
                 elif nfo_update:
-                    log("INFO", f"    ℹ️  Keine NFO vorhanden – Update übersprungen.")
+                    log("INFO", "    ℹ️  Keine NFO vorhanden – Update übersprungen.")
 
     if stopp_event and stopp_event.is_set() and not simulation:
         rollback_session(undo_log, log, task_q)
@@ -1290,7 +1737,8 @@ def verarbeite_sammlung(
         # DV-Profil-Prüfung: Profil 5 (ICtCp) → P5→P8-Konvertierung oder Warnung
         braucht_p5_fix = False
         dv_profil, farb_matrix = ermittle_dv_profil(ffprobe, mkv_pfad)
-        _ictcp = farb_matrix and "ictcp" in str(farb_matrix).lower()
+        _ictcp = farb_matrix and any(kw in str(farb_matrix).lower()
+                                    for kw in ("ictcp", "ipt-pq", "ipt_pq"))
         if dv_profil == 5 or _ictcp:
             braucht_p5_fix = True
             if DOVI_TOOL.exists():
@@ -1346,8 +1794,10 @@ def verarbeite_sammlung(
                     ffmpeg, mkv_pfad, mp4_pfad,
                     log_q, task_q, simulation, log_zeilen,
                     stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                    ffprobe_pfad=ffprobe
+                    ffprobe_pfad=ffprobe, kein_faststart=True
                 )
+                if erfolg:
+                    nachbearbeite_dv_mp4(mp4_pfad, log_q, log_zeilen, simulation)
             if erfolg:
                 stats["remuxed"] += 1
                 neu_remuxed = True
@@ -1410,7 +1860,7 @@ def verarbeite_sammlung(
     if simulation:
         log("SIM", "\n  [SIM] SIMULATION - es wurden KEINE Dateien veraendert.")
 
-    # 9. Log-Datei schreiben
+    # 10. Log-Datei schreiben
     log_pfad = schreibe_log_datei(log_zeilen, simulation)
     log("HEAD", f"\n  Log gespeichert: {log_pfad.name}")
     log("HEAD", f"  Speicherort:     {log_pfad.parent}")
@@ -1487,7 +1937,8 @@ def verarbeite_einzelordner(
     # DV-Profil-Prüfung: Profil 5 (ICtCp) → P5→P8-Konvertierung oder Warnung
     braucht_p5_fix = False
     dv_profil, farb_matrix = ermittle_dv_profil(ffprobe, mkv_pfad)
-    _ictcp = farb_matrix and "ictcp" in str(farb_matrix).lower()
+    _ictcp = farb_matrix and any(kw in str(farb_matrix).lower()
+                                    for kw in ("ictcp", "ipt-pq", "ipt_pq"))
     if dv_profil == 5 or _ictcp:
         braucht_p5_fix = True
         if DOVI_TOOL.exists():
@@ -1544,7 +1995,9 @@ def verarbeite_einzelordner(
                 ffmpeg, mkv_pfad, mp4_pfad,
                 log_q, task_q, simulation, log_zeilen,
                 stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                ffprobe_pfad=ffprobe)
+                ffprobe_pfad=ffprobe, kein_faststart=True)
+            if erfolg:
+                nachbearbeite_dv_mp4(mp4_pfad, log_q, log_zeilen, simulation)
         if erfolg:
             stats["remuxed"] += 1
             neu_remuxed = True
@@ -1812,30 +2265,6 @@ class App(tk.Tk):
         panel = ttk.Frame(self, style="Panel.TFrame")
         panel.pack(fill="x", padx=20, pady=(0,8))
         panel.columnconfigure(1, weight=1)
-
-        # ── Pfad-Zeilen Hilfsfunktion ─────────────────────────────────────
-        def pfad_zeile(row, label, var, datei=False, hint=""):
-            ttk.Label(panel, text=label, style="Muted.TLabel").grid(
-                row=row, column=0, padx=(12,8), pady=(9,0), sticky="w")
-            ttk.Entry(panel, textvariable=var).grid(
-                row=row, column=1, padx=(0,6), pady=(9,0),
-                sticky="ew", ipady=4)
-            def wähle():
-                if datei:
-                    typen = ([("Executable","*.exe"),("Alle","*")]
-                              if sys.platform=="win32" else [("Alle","*")])
-                    p = filedialog.askopenfilename(
-                        title=label, filetypes=typen,
-                        initialdir=str(Path(var.get()).parent) if var.get() else "/")
-                else:
-                    p = filedialog.askdirectory(
-                        title=label, initialdir=var.get() or "/")
-                if p:
-                    var.set(p)
-                    self._ffbin_status_update()
-            ttk.Button(panel, text="📂", style="Browse.TButton",
-                       command=wähle, width=4).grid(
-                row=row, column=2, padx=(0,12), pady=(9,0))
 
         # ── Zeile 0: ffmpeg-Ordner ────────────────────────────────────────
         ttk.Label(panel, text="ffmpeg  Ordner", style="Muted.TLabel").grid(
@@ -2137,7 +2566,25 @@ class App(tk.Tk):
         lnk.bind("<Button-1>", lambda _: webbrowser.open(REPO))
 
         tk.Label(dlg, text="hero.ommen@posteo.de", fg=self.MUTED, bg=self.BG,
-                 font=("Consolas",9)).pack(pady=(0,16))
+                 font=("Consolas",9)).pack(pady=(0,12))
+
+        # Drittanbieter
+        tk.Frame(dlg, bg=self.BORDER, height=1).pack(fill="x", padx=20)
+        tk.Label(dlg, text="Drittanbieter-Komponenten",
+                 fg=self.MUTED, bg=self.BG,
+                 font=("Consolas",8,"bold")).pack(pady=(10,2))
+
+        DOVI_URL = "https://github.com/quietvoid/dovi_tool"
+        dovi_lnk = tk.Label(dlg,
+                             text="dovi_tool  (quietvoid)  –  GPL v3.0 or later",
+                             fg=self.ACCENT, bg=self.BG,
+                             font=("Consolas",8,"underline"), cursor="hand2")
+        dovi_lnk.pack()
+        dovi_lnk.bind("<Button-1>", lambda _: webbrowser.open(DOVI_URL))
+
+        tk.Label(dlg,
+                 text="Wird verwendet für DV-Profil-5 → Profil-8-Konvertierung.",
+                 fg=self.MUTED, bg=self.BG, font=("Consolas",8)).pack(pady=(0,14))
 
         ttk.Button(dlg, text="Schließen", style="Log.TButton",
                    command=dlg.destroy).pack(pady=(0,16))
@@ -2145,7 +2592,6 @@ class App(tk.Tk):
     # ─── Modus-Toggle ─────────────────────────────────────────────────────────
     def _set_modus(self, wert):
         self.var_modus.set(wert)
-        self._toggle_styles_update()
 
     def _toggle_opt(self, var):
         var.set(not var.get())
