@@ -1,8 +1,18 @@
 """
-dv_remux_gui.py  v5.5.0
+dv_remux_gui.py  v5.6.0
 =======================
 GUI-Tool: Dolby Vision MKV → MP4 Remux + SRT Untertitel-Extraktion
 Für Jellyfin / LG TV
+
+Neu in v5.6.0:
+  • CMv4.0-Metadaten bei P5→P8-Konvertierung (dovi_tool ≥ 2.3.3):
+    Standard-CMv4.0-Extension-Metadaten (L3, L9, L11, L254) werden jetzt
+    automatisch zum konvertierten RPU hinzugefügt. Das verbessert das
+    Tone-Mapping auf Geräten die CMv4.0 unterstützen (z. B. neuere LG-Modelle).
+    Umgesetzt via dovi_tool --edit-config mit add_cmv4_default_metadata=true,
+    kombiniert in Schritt 2 der bestehenden 5-Schritt-Pipeline.
+    Bei älteren dovi_tool-Versionen (<2.3.3) wird die Option still ignoriert;
+    die Konvertierung läuft trotzdem korrekt durch.
 
 Neu in v3:
   • NFO-Aktualisierung: original_filename .mkv→.mp4, Untertitel-Einträge
@@ -77,7 +87,7 @@ from datetime import datetime
 #  KONSTANTEN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "5.5.0"
+VERSION      = "5.6.0"
 CONFIG_ORDNER = Path(__file__).parent / "config"
 CONFIG_DATEI  = CONFIG_ORDNER / "dv_remux_config.json"
 LOG_ORDNER    = Path(__file__).parent / "logs"
@@ -630,7 +640,8 @@ def konvertiere_dv_p5_zu_p8(
     """
     DV Profil 5 (ICtCp) → Profil 8.1 (HDR10-kompatibel) ohne Re-Encoding:
       Schritt 1: HEVC-Stream extrahieren (ffmpeg -c:v copy)
-      Schritt 2: RPU konvertieren P5→P8.1 (dovi_tool -m 3 convert)
+      Schritt 2: RPU konvertieren P5→P8.1 + CMv4.0-Metadaten
+                 (dovi_tool --edit-config add_cmv4_default_metadata=true -m 3 convert)
       Schritt 3: MP4 zusammensetzen (P8-HEVC + Audio aus Original-MKV, kein faststart)
       Schritt 4: dvcC-Box injizieren (Dolby Vision Configuration Record)
       Schritt 5: faststart – moov vor mdat schieben, major_brand mp42
@@ -648,12 +659,13 @@ def konvertiere_dv_p5_zu_p8(
             time.sleep(0.04)
         return True
 
-    tmp_dir     = Path(tempfile.gettempdir())
-    tmp_hevc    = tmp_dir / f"_dv_remux_{mp4_pfad.stem}.hevc"
-    tmp_hevc_p8 = tmp_dir / f"_dv_remux_{mp4_pfad.stem}_p8.hevc"
+    tmp_dir        = Path(tempfile.gettempdir())
+    tmp_hevc       = tmp_dir / f"_dv_remux_{mp4_pfad.stem}.hevc"
+    tmp_hevc_p8    = tmp_dir / f"_dv_remux_{mp4_pfad.stem}_p8.hevc"
+    tmp_editor_cfg = tmp_dir / f"_dv_remux_{mp4_pfad.stem}_editor.json"
 
     def cleanup():
-        for tmp in (tmp_hevc, tmp_hevc_p8):
+        for tmp in (tmp_hevc, tmp_hevc_p8, tmp_editor_cfg):
             try:
                 if tmp.exists():
                     tmp.unlink()
@@ -705,23 +717,48 @@ def konvertiere_dv_p5_zu_p8(
         log_q.put(("OK", "     ✅ HEVC extrahiert"))
         log_zeilen.append("     OK: HEVC extrahiert")
 
-        # ── Schritt 2: RPU P5 → P8.1 konvertieren ─────────────────────────
-        task_q.put({"schritt": "P5→P8 [2/5]: RPU konvertieren …", "sub_prog": 25})
-        log_q.put(("INFO", "  🔬  [2/5] RPU Profil 5 → 8.1 (dovi_tool) …"))
-        log_zeilen.append("  [2/5] dovi_tool P5->P8")
+        # ── Schritt 2: RPU P5 → P8.1 konvertieren + CMv4.0-Metadaten ────────
+        task_q.put({"schritt": "P5→P8 [2/5]: RPU konvertieren + CMv4.0 …", "sub_prog": 25})
+        log_q.put(("INFO", "  🔬  [2/5] RPU Profil 5 → 8.1 + CMv4.0-Metadaten (dovi_tool) …"))
+        log_zeilen.append("  [2/5] dovi_tool P5->P8 + CMv4.0")
 
-        befehl2 = [str(dovi_tool), "-m", "3", "convert",
-                   str(tmp_hevc), "-o", str(tmp_hevc_p8)]
+        # CMv4.0-Editor-Config schreiben (dovi_tool ≥ 2.3.3); ältere Versionen
+        # ignorieren unbekannte JSON-Keys ohne Fehler.
+        cmv4_aktiv = False
+        try:
+            tmp_editor_cfg.write_text('{"add_cmv4_default_metadata": true}',
+                                      encoding="utf-8")
+            befehl2 = [str(dovi_tool),
+                       "--edit-config", str(tmp_editor_cfg),
+                       "-m", "3", "convert",
+                       str(tmp_hevc), "-o", str(tmp_hevc_p8)]
+            cmv4_aktiv = True
+        except Exception:
+            befehl2 = [str(dovi_tool), "-m", "3", "convert",
+                       str(tmp_hevc), "-o", str(tmp_hevc_p8)]
+
         erg2 = subprocess.run(befehl2, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=600)
+        if erg2.returncode != 0 and cmv4_aktiv:
+            # Fallback: ohne --edit-config (sehr alte dovi_tool-Version)
+            log_q.put(("WARN", "  ⚠  CMv4.0 nicht unterstützt – Fallback (ohne edit-config)"))
+            log_zeilen.append("  WARNUNG: CMv4.0-Fallback, dovi_tool < 2.3.3?")
+            befehl2 = [str(dovi_tool), "-m", "3", "convert",
+                       str(tmp_hevc), "-o", str(tmp_hevc_p8)]
+            erg2 = subprocess.run(befehl2, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=600)
+            cmv4_aktiv = False
+
         if erg2.returncode != 0:
             fehler = (erg2.stderr or erg2.stdout or "").strip()[-300:]
             log_q.put(("ERR", f"  ❌ dovi_tool Fehler (Code {erg2.returncode}):\n     {fehler}"))
             log_zeilen.append(f"  FEHLER: dovi_tool Code {erg2.returncode}: {fehler}")
             cleanup(); return False
+
         task_q.put({"sub_prog": 50})
-        log_q.put(("OK", "     ✅ RPU zu Profil 8.1 konvertiert"))
-        log_zeilen.append("     OK: RPU Profil 8")
+        cmv4_suffix = " + CMv4.0" if cmv4_aktiv else ""
+        log_q.put(("OK", f"     ✅ RPU zu Profil 8.1 konvertiert{cmv4_suffix}"))
+        log_zeilen.append(f"     OK: RPU Profil 8{cmv4_suffix}")
 
         # DV-Level für dvcC-Box aus Streaminfo bestimmen
         dv_level = 6
@@ -825,8 +862,9 @@ def konvertiere_dv_p5_zu_p8(
         log_zeilen.append("  [5/5] faststart")
         if mache_faststart_und_ftyp(mp4_pfad):
             task_q.put({"sub_prog": 100})
-            log_q.put(("OK", "     ✅ MP4 fertig (DV P8.1, dvcC, faststart, mp42)"))
-            log_zeilen.append("     OK: MP4 fertig (DV Profil 8)")
+            cmv4_info = ", CMv4.0" if cmv4_aktiv else ""
+            log_q.put(("OK", f"     ✅ MP4 fertig (DV P8.1, dvcC{cmv4_info}, faststart, mp42)"))
+            log_zeilen.append(f"     OK: MP4 fertig (DV Profil 8{cmv4_info})")
             return True
         else:
             # faststart-Fehler ist nicht fatal — dvcC ist bereits gesetzt
