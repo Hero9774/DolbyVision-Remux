@@ -13,7 +13,7 @@ from pathlib import Path
 
 from dv_remux.konstanten import LOG_ORDNER, TEXT_CODECS, VERSION
 from dv_remux.sprache import t, _bereinige_log
-from dv_remux.mkv_analyse import ermittle_audio_streams
+from dv_remux.mkv_analyse import ermittle_audio_streams, ermittle_video_codec
 from dv_remux.mp4_binary import _berechne_dv_level, injiziere_dvcc_box, mache_faststart_und_ftyp
 
 
@@ -588,6 +588,19 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
     else:
         audio_maps = ["-map", "0:a"]
 
+    # Video-Tag codec-abhängig wählen: 'hvc1' gilt nur für HEVC (LG-TV-Kompatibilität).
+    # Bei AV1 (Dolby Vision Profil 10) ist hvc1 inkompatibel → ffmpeg bricht ab
+    # ("Tag hvc1 incompatible with output codec id 'av01'"). Dort keinen Tag setzen –
+    # ffmpeg vergibt den korrekten 'av01'-Tag automatisch.
+    video_codec = ermittle_video_codec(ffprobe_pfad, mkv_pfad) if ffprobe_pfad else None
+    if video_codec == "av1":
+        video_tag = []
+        text = t("remux.av1_detected")
+        log_q.put(("INFO", text))
+        log_zeilen.append(_bereinige_log(text))
+    else:
+        video_tag = ["-tag:v", "hvc1"]
+
     # Kommando aufbauen – 0:v:0 = nur Haupt-Videostream (kein MJPEG-Cover)
     fs_flags = [] if kein_faststart else ["-movflags", "+faststart"]
     if text_sub_indices:
@@ -596,13 +609,13 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
         for idx in text_sub_indices:
             befehl += ["-map", f"0:{idx}"]
         befehl += (["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
-                    "-strict", "unofficial", "-tag:v", "hvc1"]
+                    "-strict", "unofficial"] + video_tag
                    + fs_flags + ["-y", str(mp4_pfad)])
     else:
         # Nur Haupt-Video + Audio mappen
         befehl = ([str(ffmpeg), "-i", str(mkv_pfad), "-map", "0:v:0"]
                   + audio_maps
-                  + ["-c", "copy", "-strict", "unofficial", "-tag:v", "hvc1"]
+                  + ["-c", "copy", "-strict", "unofficial"] + video_tag
                   + fs_flags + ["-y", str(mp4_pfad)])
 
     text = t("remux.running", mkv=mkv_pfad.name, mp4=mp4_pfad.name)

@@ -23,6 +23,27 @@ def finde_mkv(ordner: Path):
     dateien = list(ordner.glob("*.mkv"))
     return dateien[0] if dateien else None
 
+def ermittle_video_codec(ffprobe: Path, mkv_pfad: Path):
+    """Codec des Haupt-Videostreams ermitteln (via ffprobe).
+    Gibt den ffprobe-codec_name zurück (z.B. 'hevc', 'av1', 'h264') oder None.
+    Wird benötigt, um den MP4-Video-Tag korrekt zu wählen: 'hvc1' gilt nur für
+    HEVC – bei AV1 (Dolby Vision Profil 10) ist er inkompatibel.
+    """
+    befehl = [
+        str(ffprobe), "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-select_streams", "v:0", str(mkv_pfad)
+    ]
+    try:
+        erg = subprocess.run(befehl, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace",
+                             check=True, timeout=60)
+        streams = json.loads(erg.stdout).get("streams", [])
+        if streams:
+            return streams[0].get("codec_name")
+    except Exception:
+        pass
+    return None
+
 def ermittle_audio_streams(ffprobe: Path, mkv_pfad: Path) -> list:
     """Audio-Streams analysieren – gibt Liste mit index + codec_name zurück.
     Wird für den TrueHD-Fallback in remux_zu_mp4 benötigt: TrueHD ist im

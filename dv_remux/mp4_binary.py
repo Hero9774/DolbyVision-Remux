@@ -282,8 +282,8 @@ def mache_faststart_und_ftyp(mp4_pfad: Path) -> bool:
         return False
 
 
-def _dvcc_vorhanden(mp4_pfad: Path) -> bool:
-    """Prüft ob eine dvcC-Box in der MP4-Datei vorhanden ist (schnelle Byte-Suche im moov)."""
+def _moov_enthaelt(mp4_pfad: Path, signatur: bytes) -> bool:
+    """Prüft ob eine Byte-Signatur im moov-Atom der MP4 vorkommt (schnelle Suche)."""
     try:
         with open(mp4_pfad, "rb") as f:
             total = f.seek(0, 2); f.seek(0)
@@ -301,11 +301,16 @@ def _dvcc_vorhanden(mp4_pfad: Path) -> bool:
                 if bsz < 8: break
                 if btyp == b"moov":
                     daten = f.read(bsz - hdr)
-                    return b"dvcC" in daten
+                    return signatur in daten
                 pos += bsz
     except Exception:
         pass
     return False
+
+
+def _dvcc_vorhanden(mp4_pfad: Path) -> bool:
+    """Prüft ob eine dvcC-Box in der MP4-Datei vorhanden ist (schnelle Byte-Suche im moov)."""
+    return _moov_enthaelt(mp4_pfad, b"dvcC")
 
 
 def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,
@@ -316,7 +321,33 @@ def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,
     """
     if simulation:
         return
-    hat_dvcc = _dvcc_vorhanden(mp4_pfad)
+    # AV1-Video (DV Profil 10): die HEVC-dvcC-Injektion ist nicht anwendbar
+    # (av01-Entry statt hvc1/dvh1, DV-Config-Box wäre dvvC). Schritt überspringen –
+    # faststart+mp42 werden trotzdem ausgeführt.
+    if _moov_enthaelt(mp4_pfad, b"av01"):
+        text = t("postproc.dvcc_av1_skip")
+        log_q.put(("INFO", text))
+        log_zeilen.append(_bereinige_log(text))
+    else:
+        hat_dvcc = _dvcc_vorhanden(mp4_pfad)
+        _dvcc_schritt(mp4_pfad, hat_dvcc, log_q, log_zeilen)
+
+    text = t("postproc.faststart_running")
+    log_q.put(("INFO", text))
+    log_zeilen.append(_bereinige_log(text))
+    if mache_faststart_und_ftyp(mp4_pfad):
+        text = t("postproc.faststart_ok")
+        log_q.put(("OK", text))
+        log_zeilen.append(_bereinige_log(text))
+    else:
+        text = t("postproc.faststart_failed")
+        log_q.put(("WARN", text))
+        log_zeilen.append(_bereinige_log(text))
+
+
+def _dvcc_schritt(mp4_pfad: Path, hat_dvcc: bool, log_q: queue.Queue,
+                  log_zeilen: list) -> None:
+    """HEVC-dvcC-Box prüfen/injizieren (aus nachbearbeite_dv_mp4 ausgelagert)."""
     if not hat_dvcc:
         text = t("postproc.dvcc_missing")
         log_q.put(("INFO", text))
@@ -332,16 +363,4 @@ def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,
     else:
         text = t("postproc.dvcc_already")
         log_q.put(("INFO", text))
-        log_zeilen.append(_bereinige_log(text))
-
-    text = t("postproc.faststart_running")
-    log_q.put(("INFO", text))
-    log_zeilen.append(_bereinige_log(text))
-    if mache_faststart_und_ftyp(mp4_pfad):
-        text = t("postproc.faststart_ok")
-        log_q.put(("OK", text))
-        log_zeilen.append(_bereinige_log(text))
-    else:
-        text = t("postproc.faststart_failed")
-        log_q.put(("WARN", text))
         log_zeilen.append(_bereinige_log(text))
