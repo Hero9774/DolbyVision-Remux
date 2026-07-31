@@ -322,11 +322,15 @@ def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,
     if simulation:
         return
     # AV1-Video (DV Profil 10): die HEVC-dvcC-Injektion ist nicht anwendbar
-    # (av01-Entry statt hvc1/dvh1, DV-Config-Box wäre dvvC). Schritt überspringen –
-    # faststart+mp42 werden trotzdem ausgeführt.
+    # (av01-Entry statt hvc1/dvh1). ffmpeg schreibt die DV-Signalisierung bereits
+    # als dvvC-Box beim -c copy-Remux – nur prüfen, nicht selbst injizieren.
     if _moov_enthaelt(mp4_pfad, b"av01"):
-        text = t("postproc.dvcc_av1_skip")
-        log_q.put(("INFO", text))
+        if _moov_enthaelt(mp4_pfad, b"dvvC"):
+            text = t("postproc.dvvc_present")
+            log_q.put(("OK", text))
+        else:
+            text = t("postproc.dvvc_missing")
+            log_q.put(("WARN", text))
         log_zeilen.append(_bereinige_log(text))
     else:
         hat_dvcc = _dvcc_vorhanden(mp4_pfad)
