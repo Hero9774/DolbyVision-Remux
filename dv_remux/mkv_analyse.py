@@ -44,11 +44,52 @@ def ermittle_video_codec(ffprobe: Path, mkv_pfad: Path):
         pass
     return None
 
+def ermittle_video_geometrie(ffprobe: Path, pfad: Path) -> dict:
+    """Codec, Auflösung und Pixel-Seitenverhältnis des Haupt-Videostreams.
+
+    Gibt {'codec', 'breite', 'hoehe', 'sar': (z, n)} zurück (leeres dict bei
+    Fehler). Wird für die Anamorph-Korrektur gebraucht: Quellen mit SAR ≠ 1:1
+    (z. B. 3840x2080 mit SAR 481:480) landen sonst als anamorphe MP4 im
+    Container, und Jellyfin verweigert dafür die direkte Wiedergabe
+    ("anamorphic video is not supported").
+    """
+    befehl = [
+        str(ffprobe), "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-select_streams", "v:0", str(pfad)
+    ]
+    try:
+        erg = subprocess.run(befehl, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace",
+                             check=True, timeout=60)
+        streams = json.loads(erg.stdout).get("streams", [])
+        if not streams:
+            return {}
+        s = streams[0]
+        sar = (1, 1)
+        roh = s.get("sample_aspect_ratio", "")
+        if roh and ":" in roh:
+            try:
+                z, n = (int(x) for x in roh.split(":"))
+                if z > 0 and n > 0:
+                    sar = (z, n)
+            except ValueError:
+                pass
+        return {
+            "codec":  s.get("codec_name"),
+            "breite": int(s.get("width") or 0),
+            "hoehe":  int(s.get("height") or 0),
+            "sar":    sar,
+        }
+    except Exception:
+        return {}
+
+
 def ermittle_audio_streams(ffprobe: Path, mkv_pfad: Path) -> list:
-    """Audio-Streams analysieren – gibt Liste mit index + codec_name zurück.
+    """Audio-Streams analysieren – Liste mit index, codec_name und Kanalzahl.
     Wird für den TrueHD-Fallback in remux_zu_mp4 benötigt: TrueHD ist im
     MP4-Container nicht erlaubt; mit den zurückgegebenen Indizes können
-    inkompatible Tracks gezielt ausgelassen werden.
+    inkompatible Tracks gezielt ausgelassen werden. Die Kanalzahl braucht die
+    DTS→E-AC3-Wandlung (E-AC3 kann höchstens 5.1).
     """
     befehl = [
         str(ffprobe), "-v", "quiet", "-print_format", "json",
@@ -60,7 +101,9 @@ def ermittle_audio_streams(ffprobe: Path, mkv_pfad: Path) -> list:
                              check=True, timeout=60)
         daten = json.loads(erg.stdout)
         return [
-            {"index": s.get("index", "?"), "codec": s.get("codec_name", "unbekannt")}
+            {"index":   s.get("index", "?"),
+             "codec":   s.get("codec_name", "unbekannt"),
+             "kanaele": int(s.get("channels") or 2)}
             for s in daten.get("streams", [])
         ]
     except Exception:

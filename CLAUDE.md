@@ -18,6 +18,65 @@ Zwei Betriebsmodi (Radiobutton in der GUI, Config-Key `"modus"`):
 - **`"filme"`** – ein MKV pro Unterordner, steuert `verarbeite_sammlung()`
 - **`"serien"`** – rekursive Staffel/Episode-Struktur, steuert `verarbeite_serien()`; überspringt Trickplay-Ordner (`trickplay` im Pfad)
 
+## Dolby-Vision-Box und anamorphe Quellen (Stolperfallen)
+
+- **Es gibt zwei Boxnamen für denselben Record.** Nach der Dolby-ISOBMFF-Spec
+  gehört `dvvC` in einen `hvc1`/`hev1`-Entry (cross-kompatible Profile 8.x) und
+  `dvcC` in einen `dvh1`/`dvhe`-Entry. Aktuelle ffmpeg-Versionen schreiben `dvvC`
+  beim Muxen bereits selbst – prüft man nur auf `dvcC`, landet eine zweite Box
+  in derselben Sample-Entry. `_dvcc_vorhanden()` prüft deshalb `DV_BOX_TYPEN`.
+- **Der Record ist 24 Byte lang** (Box also 32 Byte), inklusive der vier
+  Reserved-Words. Eine kürzere Box ist defekt, auch wenn ffprobe die ersten
+  Felder noch korrekt anzeigt.
+- **Anamorphe Quellen** (SAR ≠ 1:1) lehnt Jellyfin für Direct Play ab
+  („anamorphic video is not supported"). `anamorph_argumente()` in pipeline.py
+  korrigiert bis 1 % Abweichung mit **`-aspect W:H` allein** – die `pasp`-Box im
+  Container hat für ffprobe Vorrang vor der VUI. Über der Toleranz (echtes
+  anamorphes Material wie PAL SAR 16:15) wird nicht gepatcht, sonst wäre das
+  Bild sichtbar verzerrt; dort hilft nur Skalieren = Neucodierung.
+- **Niemals `-bsf:v hevc_metadata` auf Dolby-Vision-Material anwenden.** Der
+  Filter serialisiert VPS/SPS/PPS neu (im Test 12 → 6 Parametersätze), danach
+  passt die RPU nicht mehr dazu: ffmpeg dekodiert die Datei klaglos, auf dem TV
+  zerfällt das Bild in Farbschlieren. Am LG G4 verifiziert. Prüfmethode: NAL-Typen
+  im Elementarstrom zählen (Typ 32/33/34 = VPS/SPS/PPS, Typ 62 = RPU) und mit der
+  Quelle vergleichen.
+- **DTS in MP4 ist eine Sackgasse.** ffmpeg schreibt es nur als `mp4a`+esds
+  (OTI 0xA9); `-tag:a dtsc` lehnt der Muxer ab. Hardware-Player verweigern dann
+  die **ganze Datei**, auch wenn sie DTS können. Deshalb `dts_audio_argumente()`
+  → E-AC3 640k pro betroffener Spur, alle anderen bleiben `copy`.
+- Ein MP4→MP4-Remux verliert die DV-Signalisierung: Reparaturen immer aus der
+  Original-MKV fahren.
+
+## Unterprogramm: Video-Konverter
+
+Zweites, unabhängiges Fenster (Button „🎬 Video-Konverter" in der Button-Leiste,
+`App._konverter_oeffnen()` → `dv_remux/konverter_gui.py`). Es hat **eigene** Queues,
+ein eigenes `stopp_event` und einen eigenen Poll-Loop – die `done_queue`-Stats des
+Hauptfensters (`remuxed`/`fehler`) und die des Konverters
+(`konvertiert`/`fehler`/`uebersprungen`/`gefunden`) dürfen deshalb nicht vermischt werden.
+
+- Logik in `dv_remux/konverter.py`, Worker `verarbeite_videoordner()`
+- Phase 1 Scan (`analysiere_video()` via ffprobe: Auflösung, SAR, field_order, fps, Audio),
+  Phase 2 Re-Encode aller Nicht-MP4-Dateien. `.mkv` steht bewusst **nicht** in
+  `VIDEO_ENDUNGEN` (gehört zum Remux-Teil) und wird als SKIP gemeldet
+- Encoder-Wahl: `ermittle_encoder()` prüft AMF **mit echtem 1-Sekunden-Testencode**
+  (`-encoders` beweist nur Compile-Zeit-Support) und cached das Ergebnis;
+  Fallback-Kette pro Datei: HW mit Subs → HW ohne Subs → `libx264`/`libx265`
+- Ziel-Codec-Vorgabe ist **HEVC**; Ratenkontrolle über Zielbitrate
+  (`berechne_bitrate()`, Peak-VBR) statt CQP – bei konstantem Quantizer werden
+  verrauschte alte Quellen sonst größer als das Original
+- Ausgabe: HEVC + `hvc1` bzw. H.264 High, `yuv420p`, AAC (Copy wenn Quelle schon AAC),
+  `-movflags +faststart`, GOP = 2 s (Vorspulen), `yadif` bei interlaced,
+  SAR ≠ 1:1 → auf quadratische Pixel skalieren, sonst Auflösung unverändert
+- **Lokale Verarbeitung** (Standard an): Original per `verschiebe_sicher()` in
+  `<Arbeitsordner>/dv_konverter`, dort konvertieren, MP4 zurück, Original löschen.
+  Jeder Fehlerpfad (Encode, Rücktransfer, Abbruch) ruft `zurueck_an_ursprung()`
+- **Alle Pfade kommen aus dem Hauptfenster**: das Konverter-Fenster bindet direkt
+  an `app.var_root` / `app.var_lokale_kopie_pfad` und liest `old_mkv_pfad` +
+  `ffbin` – keine eigenen Pfad-Config-Keys anlegen
+- Eigene Config-Keys nur mit Präfix `konv_`; `App._config_dict()` baut auf
+  `self.cfg` auf, damit die Keys des jeweils anderen Fensters erhalten bleiben
+
 ## Verarbeitungs-Pipeline
 
 Der Worker `verarbeite_sammlung()` läuft in einem eigenen Thread und durchläuft für jeden Unterordner:

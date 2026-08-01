@@ -29,7 +29,8 @@ def verarbeite_serien(
         log_q: queue.Queue, task_q: queue.Queue,
         fort_q: queue.Queue, done_q: queue.Queue,
         stopp_event=None, old_mkv_global_pfad: Path = None,
-        lokale_kopie: bool = False, lokale_kopie_pfad: Path = None):
+        lokale_kopie: bool = False, lokale_kopie_pfad: Path = None,
+        dts_zu_eac3: bool = False):
     """Serien-Worker: root → Show-Ordner → Staffel-Ordner → episode.mkv"""
 
     ffmpeg     = Path(ffmpeg_pfad)
@@ -198,7 +199,8 @@ def verarbeite_serien(
                                 ffmpeg, arbeits_mkv, arbeits_mp4,
                                 log_q, task_q, simulation, log_zeilen,
                                 stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                                ffprobe_pfad=ffprobe, kein_faststart=True)
+                                ffprobe_pfad=ffprobe, kein_faststart=True,
+                                dts_zu_eac3=dts_zu_eac3)
                             if remux_ok:
                                 nachbearbeite_dv_mp4(arbeits_mp4, log_q, log_zeilen, simulation)
 
@@ -306,7 +308,8 @@ def verarbeite_sammlung(
         log_q: queue.Queue, task_q: queue.Queue,
         fort_q: queue.Queue, done_q: queue.Queue,
         stopp_event=None, old_mkv_global_pfad: Path = None,
-        lokale_kopie: bool = False, lokale_kopie_pfad: Path = None):
+        lokale_kopie: bool = False, lokale_kopie_pfad: Path = None,
+        dts_zu_eac3: bool = False):
     """Haupt-Worker (eigener Thread)."""
 
     ffmpeg  = Path(ffmpeg_pfad)
@@ -455,7 +458,8 @@ def verarbeite_sammlung(
                         ffmpeg, arbeits_mkv, arbeits_mp4,
                         log_q, task_q, simulation, log_zeilen,
                         stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                        ffprobe_pfad=ffprobe, kein_faststart=True
+                        ffprobe_pfad=ffprobe, kein_faststart=True,
+                        dts_zu_eac3=dts_zu_eac3
                     )
                     if remux_ok:
                         nachbearbeite_dv_mp4(arbeits_mp4, log_q, log_zeilen, simulation)
@@ -572,7 +576,8 @@ def verarbeite_einzelordner(
         log_q: queue.Queue, task_q: queue.Queue,
         fort_q: queue.Queue, done_q: queue.Queue,
         stopp_event=None, old_mkv_global_pfad: Path = None,
-        lokale_kopie: bool = False, lokale_kopie_pfad: Path = None):
+        lokale_kopie: bool = False, lokale_kopie_pfad: Path = None,
+        dts_zu_eac3: bool = False):
     """Einzelordner-Worker: verarbeitet genau einen Film-Ordner (direkt MKV darin)."""
 
     ffmpeg  = Path(ffmpeg_pfad)
@@ -720,7 +725,8 @@ def verarbeite_einzelordner(
                     ffmpeg, arbeits_mkv, arbeits_mp4,
                     log_q, task_q, simulation, log_zeilen,
                     stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                    ffprobe_pfad=ffprobe, kein_faststart=True)
+                    ffprobe_pfad=ffprobe, kein_faststart=True,
+                    dts_zu_eac3=dts_zu_eac3)
                 if remux_ok:
                     nachbearbeite_dv_mp4(arbeits_mp4, log_q, log_zeilen, simulation)
 

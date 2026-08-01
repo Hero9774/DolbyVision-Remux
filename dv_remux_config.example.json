@@ -5,5 +5,18 @@
   "subs": true,
   "nfo": true,
   "modus": "filme",
-  "embed_subs": true
+  "embed_subs": true,
+  "dts_eac3": true,
+  "old_mkv_modus": "lokal",
+  "old_mkv_pfad": "",
+  "lokale_kopie": false,
+  "lokale_kopie_pfad": "",
+  "sprache": "en",
+  "konv_rekursiv": false,
+  "konv_behalten": false,
+  "konv_amd": true,
+  "konv_sar": true,
+  "konv_codec": "hevc",
+  "konv_qualitaet": "mittel",
+  "konv_lokal": true
 }

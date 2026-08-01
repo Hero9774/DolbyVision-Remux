@@ -65,4 +65,5 @@ def _bereinige_log(text: str) -> str:
                 .replace("📥","EMBED:").replace("📦","MOVE:")
                 .replace("💾","BACKUP:").replace("🔬","SIM:")
                 .replace("⏮","ROLLBACK:").replace("↩","UNDO:")
+                .replace("⏭","SKIP:").replace("🎬","")
                 .replace("→","->"))

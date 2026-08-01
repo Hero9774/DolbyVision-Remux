@@ -21,6 +21,7 @@ GUI tool for **batch-remuxing Dolby Vision MKV files to MP4** — without re-enc
   - [6. Cancel & undo](#6-cancel--undo)
   - [7. Logs](#7-logs)
   - [8. Language](#8-language)
+  - [9. Video converter (sub-program)](#9-video-converter-sub-program)
 - [Expected folder structure](#expected-folder-structure)
 - [Configuration file](#configuration-file)
 - [How does the remux work?](#how-does-the-remux-work)
@@ -36,7 +37,9 @@ GUI tool for **batch-remuxing Dolby Vision MKV files to MP4** — without re-enc
 
 - **Lossless remux** from MKV → MP4 (`-c copy`, no re-encoding, no quality loss)
 - HEVC tag correction to `hvc1` for **LG TV compatibility**
-- **dvcC box injection** — the Dolby Vision Configuration Record is written directly into the MP4 via a Python binary patch; without this box, Jellyfin / LG TV do not recognize DV in the MP4 container
+- **DV configuration box** — the Dolby Vision Configuration Record (`dvvC` / `dvcC`) is written directly into the MP4 via a Python binary patch when ffmpeg has not already done so; without this box, Jellyfin / LG TV do not recognize DV in the MP4 container
+- **Anamorphic correction** — sources with SAR ≠ 1:1 (which Jellyfin refuses to play directly) are corrected in the container without touching the bitstream, as long as the deviation stays below 1 %
+- **DTS → E-AC3** — DTS cannot be stored in MP4 in a way hardware players accept; the affected tracks are converted to E-AC3 640k while everything else is copied unchanged
 - **faststart + mp42** — moves the `moov` atom before `mdat` and sets `major_brand` to `mp42` for optimal player compatibility
 - **DV Profile 5 → Profile 8.1 conversion** (blue-tint fix) via `dovi_tool -m 3 convert` — 5-step pipeline without re-encoding
 - **Three modes:**
@@ -44,6 +47,7 @@ GUI tool for **batch-remuxing Dolby Vision MKV files to MP4** — without re-enc
   - **Series** — recursive processing of season/episode structures
   - **Folder** — processes exactly one single movie folder (direct selection)
 - **Process locally (offload NAS)** — moves the source to a local working folder, runs the whole pipeline there, and transfers only the finished MP4 back to the NAS
+- **Video converter (sub-program)** — scans a folder, reports the resolution of every video file and converts everything that is not an MP4 into an LG-TV-friendly MP4, hardware-accelerated via **AMD AMF** (`h264_amf` / `hevc_amf`)
 - **Subtitle extraction** as external `.srt` files (subrip, ass, ssa, webvtt, mov_text, srt)
 - **Embed subtitles** as `mov_text` directly in the MP4
 - **NFO update** (tinyMediaManager-compatible) including a backup as `movie.nfo.bak`
@@ -135,6 +139,7 @@ Toggle buttons (`[ON]` / `[OFF]`):
 | **Create backup** | The original MKV is **kept** (moved into a backup folder) instead of being deleted. Recommended until you have verified the result. When off, the original is deleted without a backup. |
 | **Subtitles .srt** | Text-based subtitles are written as external `.srt` files next to the MP4. |
 | **Embed subs** | Extracted subtitles are embedded as a `mov_text` stream in the MP4 (can be combined with **Subtitles .srt**). |
+| **DTS → E-AC3** | DTS tracks are converted to E-AC3 640k. Leave this on unless your player definitely handles DTS inside MP4 — most TVs refuse the whole file otherwise. |
 | **Update NFO** | `movie.nfo` is updated: `original_filename` `.mkv` → `.mp4`, `<subtitle>` entries in `<streamdetails>` rewritten. A `movie.nfo.bak` is created before every change. |
 | **Process locally (offload NAS)** | See the next section. |
 
@@ -202,6 +207,33 @@ In the log window entries are **color-coded**: `OK` (green), `ERR` (red), `SIM` 
 
 A dropdown in the title bar switches the interface between **German** and **English**. The change takes effect **immediately** across the whole GUI as well as on all log/error messages, without a restart. The selection is stored in the config (key `sprache`). All texts live in `lang/de.json` and `lang/en.json`.
 
+### 9. Video converter (sub-program)
+
+The **🎬 Video converter** button (right-hand side of the button bar) opens a separate window for everything that is *not* a Dolby Vision remux: old home videos, WMV/AVI/MPG collections, downloads in odd containers.
+
+**All paths come from the main window** — source folder (`root`), working folder (`lokale_kopie_pfad`), backup folder (`old_mkv_pfad`) and the ffmpeg folder are the same fields; editing one changes both windows. There is no second set of path settings.
+
+It works in two phases:
+
+1. **Scan** — every file in the folder is analysed with ffprobe; the log lists resolution, SAR, frame rate, codec and scan type (interlaced/progressive) per file, plus the resulting output resolution.
+2. **Convert** — everything that is not already an `.mp4` is re-encoded into an MP4 that an LG TV plays with working fast-forward/seeking. `.mkv` files are **ignored** here (they belong to the remux part).
+
+| Option | Meaning |
+|---|---|
+| **AMD acceleration** | Uses `hevc_amf` / `h264_amf`. Availability is verified with a real 1-second test encode at start (not just `ffmpeg -encoders`); if the GPU path fails, `libx265` / `libx264` are used instead — per file, if a single source trips up the hardware encoder |
+| **Fix anamorphic** | MPEG/DVD/WMV sources often have non-square pixels (SAR ≠ 1:1). With this option the picture is rescaled to square pixels, otherwise the TV shows it distorted |
+| **Process locally** | Like the remux part: the original is moved to the working folder, converted there, and only the finished MP4 goes back to the source folder. This offloads the NAS. On any error — encode failure, failed transfer back, stop button — the original is moved back to its source location automatically |
+| **Include subfolders** | Also walks all subdirectories |
+| **Keep original** | ON: the original is backed up after a successful conversion (into the main window's backup folder if that is set to *global*, otherwise into an `old video` subfolder). OFF (default): the original is deleted |
+| **Target codec** | **HEVC (default)**, H.264, or `Auto` (H.264 up to 1080p, HEVC above) |
+| **Quality** | High / Medium / Small — target bitrate for 1080p25 HEVC: 6 / 4 / 2.5 Mbit/s, scaled sub-linearly by resolution and frame rate, with a 1.6× surcharge for H.264 |
+
+Bitrate control (peak VBR) is used deliberately instead of a constant quantizer: noisy old sources can end up *larger* than the original at constant quality, whereas a target bitrate keeps the output size predictable.
+
+Output profile: HEVC Main with the `hvc1` tag resp. H.264 High, `yuv420p`, AAC audio (stream-copied when the source is already AAC), `-movflags +faststart` and a fixed 2-second keyframe interval so seeking is smooth. Interlaced sources are deinterlaced with `yadif`, since AMF only encodes progressively. The source resolution is preserved — the only change is the anamorphic correction above.
+
+Files that already are `.mp4`, `.mkv` files, files whose target `.mp4` exists and files of unknown type are skipped and logged as `SKIP`. The window has its own log, its own stop button and its own log file (`logs/konverter_*.log`) and runs independently of the main remux window. Simulation mode works here too: resolutions are detected for real, nothing is written.
+
 ---
 
 ## Expected folder structure
@@ -259,11 +291,19 @@ On exit, `config/dv_remux_config.json` is saved automatically (the `config/` fol
   "nfo":               true,
   "modus":             "filme",
   "embed_subs":        true,
+  "dts_eac3":          true,
   "old_mkv_modus":     "lokal",
   "old_mkv_pfad":      "",
   "lokale_kopie":      false,
   "lokale_kopie_pfad": "",
-  "sprache":           "en"
+  "sprache":           "en",
+  "konv_rekursiv":     false,
+  "konv_behalten":     false,
+  "konv_amd":          true,
+  "konv_sar":          true,
+  "konv_codec":        "hevc",
+  "konv_qualitaet":    "mittel",
+  "konv_lokal":        true
 }
 ```
 
@@ -276,11 +316,21 @@ On exit, `config/dv_remux_config.json` is saved automatically (the `config/` fol
 | `nfo` | Update `movie.nfo` |
 | `modus` | `"filme"` \| `"serien"` \| `"ordner"` |
 | `embed_subs` | Embed subtitles in the MP4 |
+| `dts_eac3` | Convert DTS audio tracks to E-AC3 640k (default `true`) |
 | `old_mkv_modus` | Backup target: `"lokal"` (in movie folder) or `"global"` |
 | `old_mkv_pfad` | Global backup folder path (when `old_mkv_modus` = `"global"`) |
 | `lokale_kopie` | Process locally in a working folder (offload NAS) |
 | `lokale_kopie_pfad` | Local working folder path (defaults to the Windows temp folder) |
 | `sprache` | UI language: `"en"` \| `"de"` |
+| `konv_rekursiv` | Video converter: include subfolders |
+| `konv_behalten` | Video converter: back up the original (`false` = delete it after conversion) |
+| `konv_amd` | Video converter: use the AMD AMF hardware encoder |
+| `konv_sar` | Video converter: rescale anamorphic sources to square pixels |
+| `konv_codec` | Video converter: `"hevc"` (default) \| `"h264"` \| `"auto"` |
+| `konv_qualitaet` | Video converter: `"hoch"` \| `"mittel"` \| `"klein"` |
+| `konv_lokal` | Video converter: process in the working folder instead of directly at the source |
+
+> The video converter has no path keys of its own — it uses `root`, `lokale_kopie_pfad`, `old_mkv_pfad` and `ffbin` from the main window.
 
 An example file is available in [`dv_remux_config.example.json`](dv_remux_config.example.json).
 
@@ -305,9 +355,18 @@ ffmpeg -i "input.mkv" -c copy -tag:v hvc1 -map 0:v -map 0:a "output.mp4"
 | `-tag:v hvc1` | Set the HEVC codec tag to `hvc1` (LG TV expects this instead of `hev1`) |
 | `-map 0:v -map 0:a` | Keep only video and audio streams |
 
-**Phase 2 — inject the dvcC box** (Python binary patch, no external tool):
+| `-aspect W:H` | Only for slightly anamorphic sources — see below |
+| `-c:a:N eac3 -b:a:N 640k` | Only for DTS tracks — see below |
 
-The tool navigates the path `trak → mdia → minf → stbl → stsd → hvc1/dvh1` inside the `moov` atom and inserts a 16-byte `dvcC` box directly after the `hvcC` box. Without this box, Jellyfin and LG TV do not recognize Dolby Vision in the MP4 container. If the box is already present, it is skipped.
+**Anamorphic sources.** Some releases carry a sample aspect ratio ≠ 1:1 (e.g. 3840×2080 with SAR 481:480, to hit exactly 1.85:1). ffmpeg then writes a `pasp` box into the MP4, and Jellyfin refuses direct playback with *"anamorphic video is not supported"*. If the deviation is at most 1 % the tool corrects it with `-aspect` — that changes only the container's `pasp` box, which takes precedence over the VUI for ffprobe and therefore for Jellyfin. Above that threshold (real anamorphic material such as PAL DVD with SAR 16:15) the stream is **left untouched** and only a warning is logged, because correcting it there would visibly distort the picture and fixing it properly would require re-encoding.
+
+> **Do not "improve" this with `-bsf:v hevc_metadata=sample_aspect_ratio=1/1`.** The filter re-serializes VPS/SPS/PPS, and with Dolby Vision material the RPU no longer matches the parameter sets afterwards. ffmpeg still decodes the file without complaint, but on a TV the picture disintegrates into colour smears — verified on an LG G4. The container-only route provably leaves every VPS/SPS/PPS and every RPU NAL untouched.
+
+**DTS audio.** ffmpeg can only store DTS inside MP4 as an `mp4a` sample entry with an esds descriptor (objectTypeIndication 0xA9); a proper `dtsc` entry is rejected outright (*"codec not currently supported in container"*). Hardware players do not recognize that construction and refuse the **entire file**, even models that do support DTS — again verified on an LG G4, where the same file with E-AC3 plays perfectly including Dolby Vision. With the **DTS → E-AC3** toggle enabled (default) DTS tracks are converted to E-AC3 640k while every other track is still copied unchanged, as is the video.
+
+**Phase 2 — the Dolby Vision configuration box** (Python binary patch, no external tool):
+
+The tool navigates the path `trak → mdia → minf → stbl → stsd → hvc1/dvh1` inside the `moov` atom and inserts a 32-byte configuration record directly after the `hvcC` box — named `dvvC` in an `hvc1`/`hev1` entry (cross-compatible profiles 8.x) and `dvcC` in a `dvh1`/`dvhe` entry, as the Dolby ISOBMFF specification requires. Without this box, Jellyfin and LG TV do not recognize Dolby Vision in the MP4 container. Current ffmpeg versions already write `dvvC` themselves; if either box is present, nothing is injected.
 
 **Phase 3 — faststart + mp42** (Python, no ffmpeg):
 
@@ -342,10 +401,10 @@ If `dovi_tool.exe` is present in `tools/`, a **5-step pipeline** runs fully auto
 | **[1/5] Extract HEVC** | `ffmpeg -c:v copy -an -sn` → `%TEMP%\_dv_remux_*.hevc` |
 | **[2/5] RPU P5 → P8.1** | `dovi_tool -m 3 convert` — mode 3 is explicitly for Profile 5 → 8.1 |
 | **[3/5] Assemble MP4** | P8 HEVC + audio from the original MKV, `-tag:v dvh1`, no faststart |
-| **[4/5] Inject dvcC** | Dolby Vision Configuration Record (Profile 8.1, level auto, compat_id=1) |
+| **[4/5] DV config box** | Dolby Vision Configuration Record (Profile 8.1, level auto, compat_id=1) — skipped when ffmpeg already wrote one |
 | **[5/5] faststart + mp42** | `moov` before `mdat`, `major_brand = mp42` |
 
-The DV level in the dvcC box is calculated automatically from resolution and frame rate. Temp files in `%TEMP%` are cleaned up in every case. If `dovi_tool.exe` is missing, the normal remux runs through — with a warning in the log.
+The DV level in the configuration box is calculated automatically from resolution and frame rate. Temp files in `%TEMP%` are cleaned up in every case. If `dovi_tool.exe` is missing, the normal remux runs through — with a warning in the log.
 
 **Profile 5 detection** (three-stage, without NFO):
 1. `dv_profile` directly from `ffprobe` stream side-data
@@ -361,7 +420,10 @@ The DV level in the dvcC box is calculated automatically from resolution and fra
 | **"ffmpeg not found"** | The `ffbin` path does not point to the folder containing `ffmpeg.exe`. Set the full path to the `bin/` directory. |
 | **"No MKV found"** | In "Folder" mode, the chosen folder contains no `.mkv` file. |
 | **A movie is marked `[SKIP]`** | No `<hdrtype>dolbyvision</hdrtype>` in `movie.nfo` and ffprobe finds no DOVI side-data. |
-| **LG TV does not play the MP4** | Since v5.3, a dvcC box is injected and mp42 is set automatically. For older outputs: reprocess the MP4. |
+| **LG TV does not play the MP4** | The DV configuration box and mp42 are set automatically. For older outputs: reprocess the MP4. |
+| **Jellyfin: "anamorphic video is not supported"** | The source has a sample aspect ratio ≠ 1:1. Since v5.9 slightly anamorphic sources (≤ 1 % deviation) are normalized automatically — reprocess the MP4 from the original MKV. For strongly anamorphic material (e.g. PAL DVD, SAR 16:15) only re-encoding helps; the video converter does exactly that. |
+| **TV does not recognize the MP4 at all** | Most likely a DTS track: ffmpeg can only write DTS into MP4 as `mp4a`/esds, which players reject. Enable **DTS → E-AC3** and reprocess from the MKV. |
+| **Colour smears / broken picture on the TV, but ffmpeg decodes fine** | The HEVC bitstream was modified (e.g. by a metadata bitstream filter) and the Dolby Vision RPU no longer matches the parameter sets. Reprocess from the original MKV. |
 | **Restore the NFO backup** | Simply copy `movie.nfo.bak` back to `movie.nfo`. |
 | **MP4 has no subtitles in the player** | "Embed subs" must be enabled **and** the source subtitle codec must be text-based (subrip/ass/ssa/webvtt/mov_text/srt). PGS/VobSub are skipped. |
 | **The tool freezes briefly** | When a new movie starts, `ffprobe` runs — depending on the file this can take a few seconds. |
@@ -371,6 +433,19 @@ When errors occur, it is always worth checking the log under `logs/`.
 ---
 
 ## Changelog
+
+### v5.9.0
+- **Video converter** as a sub-program in its own window (button 🎬 in the main window): scans a folder, reports every file's resolution and converts everything that is not an MP4 into an LG-TV-friendly MP4 — HEVC/H.265 by default, `.mkv` files are left to the remux part
+- **AMD AMF hardware acceleration** (`hevc_amf` / `h264_amf`), verified by a real test encode at start, with an automatic per-file fallback to `libx265` / `libx264`
+- **Local processing** like the remux pipeline: the original is moved to the working folder, converted there, and only the finished MP4 goes back; the original is deleted afterwards, and on any error it is moved back to its source location
+- All paths (source, working folder, backup folder, ffmpeg) are shared with the main window
+- Preserves the source resolution, corrects anamorphic material (SAR ≠ 1:1) and deinterlaces interlaced sources; `faststart` + 2-second keyframe interval for smooth seeking on the TV
+
+**Fixes in the remux path:**
+- **No more duplicate DV box.** Current ffmpeg versions write a correct `dvvC` box themselves, but the presence check only looked for `dvcC` — so a second configuration box ended up in the same sample entry. Both names now count.
+- **Correct box size.** The injected record was 8 bytes of payload instead of the required 24 (box 16 instead of 32 bytes) and was therefore malformed. It now matches exactly what ffmpeg writes, and it is named `dvvC` in `hvc1`/`hev1` entries as the Dolby specification requires.
+- **Anamorphic sources** (SAR ≠ 1:1) are corrected via `-aspect` when the deviation is ≤ 1 %, which is what Jellyfin's *"anamorphic video is not supported"* refusal is about. Only the container is touched — modifying the bitstream instead breaks Dolby Vision playback on TVs. Stronger anamorphic material is left alone with a warning instead of being distorted.
+- **DTS → E-AC3** (new toggle, default on): DTS cannot be written into MP4 in a form hardware players accept, so affected tracks are converted to E-AC3 640k. Every other audio track and the video itself are still copied bit for bit.
 
 ### v5.8.0
 - **Multilingual UI** (German / English) with a live-switching dropdown; all texts externalized to `lang/de.json` / `lang/en.json`, identical keys enforced by a startup check

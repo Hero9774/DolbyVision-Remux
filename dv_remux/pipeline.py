@@ -13,8 +13,10 @@ from pathlib import Path
 
 from dv_remux.konstanten import LOG_ORDNER, TEXT_CODECS, VERSION
 from dv_remux.sprache import t, _bereinige_log
-from dv_remux.mkv_analyse import ermittle_audio_streams, ermittle_video_codec
-from dv_remux.mp4_binary import _berechne_dv_level, injiziere_dvcc_box, mache_faststart_und_ftyp
+from dv_remux.mkv_analyse import (ermittle_audio_streams, ermittle_video_codec,
+                                  ermittle_video_geometrie)
+from dv_remux.mp4_binary import (_berechne_dv_level, _dvcc_vorhanden,
+                                 injiziere_dvcc_box, mache_faststart_und_ftyp)
 
 
 def konvertiere_dv_p5_zu_p8(
@@ -187,6 +189,14 @@ def konvertiere_dv_p5_zu_p8(
         for idx in audio_indizes:
             audio_maps += ["-map", f"1:{idx}"]
 
+        # Anamorphe Quelle auch hier normalisieren (siehe anamorph_argumente)
+        anamorph3, status3 = anamorph_argumente(
+            ermittle_video_geometrie(ffprobe, mkv_pfad))
+        if status3 == "fix":
+            text = t("p5p8.anamorph_fix")
+            log_q.put(("INFO", text))
+            log_zeilen.append(_bereinige_log(text))
+
         # Kein -movflags +faststart: moov landet am Ende → dvcC-Injektion
         # (Schritt 4) kann Box-Offsets unverändert lassen
         befehl3 = ([str(ffmpeg),
@@ -194,8 +204,8 @@ def konvertiere_dv_p5_zu_p8(
                     "-i", str(mkv_pfad)]
                    + ["-map", "0:v:0"] + audio_maps
                    + ["-c", "copy", "-strict", "unofficial",
-                      "-tag:v", "dvh1",
-                      "-y", str(mp4_pfad)])
+                      "-tag:v", "dvh1"] + anamorph3
+                   + ["-y", str(mp4_pfad)])
 
         proc = subprocess.Popen(befehl3, stderr=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL,
@@ -245,14 +255,21 @@ def konvertiere_dv_p5_zu_p8(
         text = t("p5p8.step4_start", level=dv_level)
         log_q.put(("INFO", text))
         log_zeilen.append(_bereinige_log(text))
-        if not injiziere_dvcc_box(mp4_pfad, dv_profil=8, dv_level=dv_level, compat_id=1):
+        # Neuere ffmpeg-Versionen schreiben den DV-Record beim Muxen selbst –
+        # dann ist nichts zu injizieren und das ist kein Fehler.
+        if _dvcc_vorhanden(mp4_pfad):
+            text = t("p5p8.step4_bereits")
+            log_q.put(("OK", text))
+            log_zeilen.append(_bereinige_log(text))
+        elif not injiziere_dvcc_box(mp4_pfad, dv_profil=8, dv_level=dv_level, compat_id=1):
             text = t("p5p8.step4_failed")
             log_q.put(("ERR", text))
             log_zeilen.append(_bereinige_log(text))
             return False
-        text = t("p5p8.step4_ok")
-        log_q.put(("OK", text))
-        log_zeilen.append(_bereinige_log(text))
+        else:
+            text = t("p5p8.step4_ok")
+            log_q.put(("OK", text))
+            log_zeilen.append(_bereinige_log(text))
 
         # ── Schritt 5: faststart – moov vor mdat schieben ─────────────────
         task_q.put({"schritt": t("p5p8.taskstep5"), "sub_prog": 96})
@@ -557,18 +574,104 @@ def aktualisiere_nfo(
     task_q.put({"schritt": t("nfo.taskstep_done"), "sub_prog": 100})
 
 
+def _ggt(a: int, b: int) -> int:
+    while b:
+        a, b = b, a % b
+    return a or 1
+
+
+# Zielbitrate für die DTS→E-AC3-Wandlung (5.1 in Referenzqualität)
+EAC3_BITRATE = "640k"
+
+# Bis zu dieser SAR-Abweichung wird auf quadratische Pixel normalisiert.
+# 1 % ist unsichtbar; darüber müsste man skalieren – und das ginge nur mit
+# Neucodierung, die beim Dolby-Vision-Remux gerade nicht stattfinden soll.
+ANAMORPH_TOLERANZ = 0.01
+
+
+def anamorph_argumente(geometrie: dict) -> tuple:
+    """
+    ffmpeg-Argumente, die eine leicht anamorphe Quelle auf quadratische Pixel
+    normalisieren – ohne Neucodierung und ohne den Bitstream anzufassen.
+
+    Nötig, weil Jellyfin für Videos mit SAR ≠ 1:1 die direkte Wiedergabe
+    ablehnt ("anamorphes Video wird nicht unterstützt"). `-aspect` allein
+    genügt: die pasp-Box im MP4-Container hat für ffprobe (und damit für
+    Jellyfin) Vorrang vor der SAR im HEVC-VUI.
+
+    WICHTIG – nicht auf `-bsf:v hevc_metadata=sample_aspect_ratio=1/1`
+    umstellen: der Filter serialisiert VPS/SPS/PPS neu, und bei Dolby-Vision-
+    Material passt die RPU danach nicht mehr zu den Parametersätzen. Das Bild
+    zerfällt auf dem TV in Farbschlieren, obwohl ffmpeg die Datei anstandslos
+    dekodiert (am LG G4 verifiziert). Der Container-Weg lässt VPS/SPS/PPS und
+    alle RPU-NALs nachweislich unverändert.
+
+    Rückgabe: (argumente, status) mit status ∈
+      None       – Quelle ist bereits quadratisch, nichts zu tun
+      "fix"      – wird korrigiert (Abweichung ≤ ANAMORPH_TOLERANZ)
+      "zu_stark" – echtes anamorphes Bild (z. B. PAL SAR 16:15): NICHT
+                   angefasst, weil das Bild sonst spürbar verzerrt wäre
+    """
+    sar_z, sar_n = geometrie.get("sar", (1, 1))
+    breite = geometrie.get("breite", 0)
+    hoehe  = geometrie.get("hoehe", 0)
+    if sar_z == sar_n or breite <= 0 or hoehe <= 0:
+        return [], None
+
+    if abs(sar_z / sar_n - 1.0) > ANAMORPH_TOLERANZ:
+        return [], "zu_stark"
+
+    teiler = _ggt(breite, hoehe)
+    return ["-aspect", f"{breite // teiler}:{hoehe // teiler}"], "fix"
+
+
+def dts_audio_argumente(audio_streams: list) -> tuple:
+    """
+    Pro-Spur-Audioargumente, die DTS nach E-AC3 wandeln und alles andere
+    unverändert kopieren.
+
+    Hintergrund: ffmpeg kann DTS im MP4-Container ausschließlich als
+    mp4a-Sample-Entry mit esds (objectTypeIndication 0xA9) schreiben – ein
+    eigener dtsc-Entry wird abgelehnt ("codec not currently supported in
+    container"). Hardware-Player erkennen diese Konstruktion nicht und
+    verweigern die ganze Datei, selbst wenn sie DTS eigentlich beherrschen
+    (am LG G4 verifiziert). E-AC3 640k ist der verlustarme Ausweg, der überall
+    läuft; das Video bleibt dabei unangetastet.
+
+    audio_streams: Liste in der Reihenfolge, in der die Spuren gemappt werden.
+    Rückgabe: (argumente, anzahl_gewandelter_spuren).
+    """
+    if not any(s.get("codec") == "dts" for s in audio_streams):
+        return [], 0
+
+    argumente, gewandelt = [], 0
+    for n, s in enumerate(audio_streams):
+        if s.get("codec") == "dts":
+            argumente += [f"-c:a:{n}", "eac3", f"-b:a:{n}", EAC3_BITRATE]
+            # E-AC3 kann höchstens 5.1 – 7.1-Quellen heruntermischen
+            if int(s.get("kanaele") or 2) > 6:
+                argumente += [f"-ac:a:{n}", "6"]
+            gewandelt += 1
+        else:
+            argumente += [f"-c:a:{n}", "copy"]
+    return argumente, gewandelt
+
+
 def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
                  log_q: queue.Queue, task_q: queue.Queue,
                  simulation: bool, log_zeilen: list,
                  stopp_event=None, text_sub_indices=None,
                  ffprobe_pfad: Path = None,
                  audio_indices: list = None,
-                 kein_faststart: bool = False) -> bool:
-    """Remux MKV -> MP4 ohne Re-Encoding.
+                 kein_faststart: bool = False,
+                 dts_zu_eac3: bool = False) -> bool:
+    """Remux MKV -> MP4 ohne Re-Encoding (Video immer -c copy).
     text_sub_indices: Stream-Indizes für Text-Untertitel → mov_text einbetten.
     audio_indices: Explizite Audio-Stream-Indizes (None = alle via -map 0:a).
     ffprobe_pfad: Wird für TrueHD-Retry benötigt.
     kein_faststart: True = kein -movflags +faststart (für nachgelagerte dvcC-Injektion).
+    dts_zu_eac3: DTS-Tonspuren nach E-AC3 wandeln (siehe dts_audio_argumente);
+                 alle übrigen Spuren werden weiterhin nur kopiert.
     """
     if simulation:
         embed_info = t("remux.sim_embed_info", anzahl=len(text_sub_indices)) if text_sub_indices else ""
@@ -588,11 +691,26 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
     else:
         audio_maps = ["-map", "0:a"]
 
+    # DTS ist im MP4-Container nur als mp4a/esds darstellbar und wird von
+    # Hardware-Playern nicht erkannt → auf Wunsch nach E-AC3 wandeln.
+    audio_codec_args = []
+    if dts_zu_eac3 and ffprobe_pfad:
+        alle_audio = ermittle_audio_streams(ffprobe_pfad, mkv_pfad)
+        gemappt = ([s for s in alle_audio if s["index"] in audio_indices]
+                   if audio_indices is not None else alle_audio)
+        audio_codec_args, anzahl_dts = dts_audio_argumente(gemappt)
+        if anzahl_dts:
+            text = t("remux.dts_zu_eac3", anzahl=anzahl_dts, bitrate=EAC3_BITRATE)
+            log_q.put(("INFO", text))
+            log_zeilen.append(_bereinige_log(text))
+
     # Video-Tag codec-abhängig wählen: 'hvc1' gilt nur für HEVC (LG-TV-Kompatibilität).
     # Bei AV1 (Dolby Vision Profil 10) ist hvc1 inkompatibel → ffmpeg bricht ab
     # ("Tag hvc1 incompatible with output codec id 'av01'"). Dort keinen Tag setzen –
     # ffmpeg vergibt den korrekten 'av01'-Tag automatisch.
-    video_codec = ermittle_video_codec(ffprobe_pfad, mkv_pfad) if ffprobe_pfad else None
+    geometrie   = ermittle_video_geometrie(ffprobe_pfad, mkv_pfad) if ffprobe_pfad else {}
+    video_codec = geometrie.get("codec") or (
+        ermittle_video_codec(ffprobe_pfad, mkv_pfad) if ffprobe_pfad else None)
     if video_codec == "av1":
         video_tag = []
         text = t("remux.av1_detected")
@@ -600,6 +718,18 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
         log_zeilen.append(_bereinige_log(text))
     else:
         video_tag = ["-tag:v", "hvc1"]
+
+    # Anamorphe Quelle (SAR ≠ 1:1) auf quadratische Pixel normalisieren –
+    # sonst lehnt Jellyfin die direkte Wiedergabe ab.
+    anamorph, anamorph_status = anamorph_argumente(geometrie)
+    if anamorph_status:
+        sar_z, sar_n = geometrie["sar"]
+        schluessel = {"fix": "remux.anamorph_fix",
+                      "zu_stark": "remux.anamorph_zu_stark"}[anamorph_status]
+        text = t(schluessel, sar=f"{sar_z}:{sar_n}",
+                 breite=geometrie["breite"], hoehe=geometrie["hoehe"])
+        log_q.put(("INFO" if anamorph_status == "fix" else "WARN", text))
+        log_zeilen.append(_bereinige_log(text))
 
     # Kommando aufbauen – 0:v:0 = nur Haupt-Videostream (kein MJPEG-Cover)
     fs_flags = [] if kein_faststart else ["-movflags", "+faststart"]
@@ -609,13 +739,15 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
         for idx in text_sub_indices:
             befehl += ["-map", f"0:{idx}"]
         befehl += (["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
-                    "-strict", "unofficial"] + video_tag
+                    "-strict", "unofficial"] + audio_codec_args
+                   + video_tag + anamorph
                    + fs_flags + ["-y", str(mp4_pfad)])
     else:
         # Nur Haupt-Video + Audio mappen
         befehl = ([str(ffmpeg), "-i", str(mkv_pfad), "-map", "0:v:0"]
                   + audio_maps
-                  + ["-c", "copy", "-strict", "unofficial"] + video_tag
+                  + ["-c", "copy", "-strict", "unofficial"] + audio_codec_args
+                  + video_tag + anamorph
                   + fs_flags + ["-y", str(mp4_pfad)])
 
     text = t("remux.running", mkv=mkv_pfad.name, mp4=mp4_pfad.name)
@@ -688,7 +820,8 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
                                     text_sub_indices=None,
                                     ffprobe_pfad=ffprobe_pfad,
                                     audio_indices=audio_indices,
-                                    kein_faststart=kein_faststart)
+                                    kein_faststart=kein_faststart,
+                                    dts_zu_eac3=dts_zu_eac3)
 
             # TrueHD ist im MP4-Container experimentell und von LG TV / Jellyfin
             # nicht unterstützt. Bei entsprechendem ffmpeg-Fehler: Audio-Streams
@@ -709,7 +842,8 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
                                         text_sub_indices=text_sub_indices,
                                         ffprobe_pfad=ffprobe_pfad,
                                         audio_indices=kompatibel,
-                                        kein_faststart=kein_faststart)
+                                        kein_faststart=kein_faststart,
+                                        dts_zu_eac3=dts_zu_eac3)
 
             # Return-Code: unsigned → signed für lesbare Anzeige (Windows)
             rc = proc.returncode
