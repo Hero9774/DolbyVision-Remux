@@ -25,23 +25,48 @@ def _berechne_dv_level(breite: int, hoehe: int, fps: float) -> int:
     return 9
 
 
-def injiziere_dvcc_box(mp4_pfad: Path, dv_profil: int = 8,
-                        dv_level: int = 6, compat_id: int = 1) -> bool:
+# Beide Namen des Dolby Vision Configuration Records. Welcher gilt, hängt vom
+# Sample-Entry ab (Dolby Vision Streams Within the ISO Base Media File Format):
+#   dvh1/dvhe (nicht rückwärtskompatible Profile ≤ 7) → dvcC
+#   hvc1/hev1 (cross-kompatible Profile 8.x)          → dvvC
+DV_BOX_TYPEN = (b"dvcC", b"dvvC")
+
+
+def _baue_dv_record(dv_profil: int, dv_level: int, compat_id: int) -> bytes:
     """
-    Injiziert eine dvcC-Box (Dolby Vision Configuration Record) in eine MP4-Datei.
-    Voraussetzung: moov am Ende der Datei (kein faststart-Modus).
-    Navigiert moov→trak→mdia→minf→stbl→stsd→(dvh1/hvc1) und fügt dvcC nach
-    hvcC ein. Aktualisiert nur die betroffenen Parent-Box-Größen; stco/co64
-    bleiben unberührt (mdat liegt vor moov).
+    DoViDecoderConfigurationRecord (24 Byte Payload) aufbauen.
+    Layout: version_major(8) version_minor(8) profile(7) level(6) rpu(1)
+            el(1) bl(1) compat_id(4) reserved(28) + 4×32 Bit reserved.
+    Die vier Reserved-Words gehören dazu – ohne sie ist die Box zu kurz und
+    Parser lesen über ihr Ende hinaus.
     """
-    # 16-Byte dvcC aufbauen
-    # Bit-Layout (48 Bit): profile(7)+level(6)+rpu(1)+el(1)+bl(1)+compat(4)+reserved(28)
     bits = dv_profil & 0x7F
     bits = (bits << 6) | (dv_level & 0x3F)
     bits = (bits << 3) | 0b101          # rpu=1, el=0, bl=1
     bits = (bits << 4) | (compat_id & 0xF)
     bits <<= 28                          # 28 reservierte Bits → 48 Bit gesamt
-    dvcc = struct.pack(">I4sBB", 16, b"dvcC", 1, 0) + bits.to_bytes(6, "big")
+    return struct.pack(">BB", 1, 0) + bits.to_bytes(6, "big") + b"\x00" * 16
+
+
+def _dv_box_typ(entry_typ: bytes, dv_profil: int) -> bytes:
+    """Passenden Boxnamen für den Sample-Entry wählen (siehe DV_BOX_TYPEN)."""
+    if entry_typ in (b"dvh1", b"dvhe"):
+        return b"dvcC"
+    return b"dvvC" if dv_profil >= 8 else b"dvcC"
+
+
+def injiziere_dvcc_box(mp4_pfad: Path, dv_profil: int = 8,
+                        dv_level: int = 6, compat_id: int = 1) -> bool:
+    """
+    Injiziert den Dolby Vision Configuration Record in eine MP4-Datei.
+    Voraussetzung: moov am Ende der Datei (kein faststart-Modus).
+    Navigiert moov→trak→mdia→minf→stbl→stsd→(dvh1/hvc1) und fügt die Box nach
+    hvcC ein – als dvvC bei cross-kompatiblen Profilen im hvc1-Entry, sonst als
+    dvcC. Ist bereits eine der beiden Boxen vorhanden (neuere ffmpeg-Versionen
+    schreiben dvvC selbst), wird nichts eingefügt. Aktualisiert nur die
+    betroffenen Parent-Box-Größen; stco/co64 bleiben unberührt (mdat vor moov).
+    """
+    record = _baue_dv_record(dv_profil, dv_level, compat_id)
 
     try:
         with open(mp4_pfad, "r+b") as f:
@@ -108,9 +133,9 @@ def injiziere_dvcc_box(mp4_pfad: Path, dv_profil: int = 8,
                 if typ in CONTAINER:
                     # stsd ist eine FullBox: 8 Byte extra (version+flags+entry_count)
                     kind_start = ds + (8 if typ == b"stsd" else 0)
-                    pos_ins, eltern = _suche(data, kind_start, off + sz)
+                    pos_ins, eltern, e_typ = _suche(data, kind_start, off + sz)
                     if pos_ins is not None:
-                        return pos_ins, [off] + eltern
+                        return pos_ins, [off] + eltern, e_typ
                 elif typ in HEVC_ENTRY:
                     # hvcC per Signatur finden (VisualSampleEntry-Länge
                     # variiert je nach ffmpeg-Version → kein fixer Offset)
@@ -119,20 +144,26 @@ def injiziere_dvcc_box(mp4_pfad: Path, dv_profil: int = 8,
                     if hvcc_rel >= 4:
                         hvcc_abs = ds + hvcc_rel - 4
                         hvcc_sz  = struct.unpack_from(">I", data, hvcc_abs)[0]
-                        hat_dvcc = b"dvcC" in eintrag[hvcc_rel + hvcc_sz - 4:]
-                        if 8 <= hvcc_sz <= (off + sz - hvcc_abs) and not hat_dvcc:
-                            return hvcc_abs + hvcc_sz, [off]
-            return None, []
+                        # Eine DV-Box zählt egal ob dvcC oder dvvC – sonst
+                        # entsteht eine zweite Konfiguration im selben Entry.
+                        rest = eintrag[hvcc_rel + hvcc_sz - 4:]
+                        hat_dv = any(name in rest for name in DV_BOX_TYPEN)
+                        if 8 <= hvcc_sz <= (off + sz - hvcc_abs) and not hat_dv:
+                            return hvcc_abs + hvcc_sz, [off], typ
+            return None, [], None
 
-        einfuege_pos, groessen_offs = _suche(moov, 8, n)
+        einfuege_pos, groessen_offs, entry_typ = _suche(moov, 8, n)
         if einfuege_pos is None:
             return False
 
-        moov[einfuege_pos:einfuege_pos] = dvcc
+        box_typ = _dv_box_typ(entry_typ, dv_profil)
+        dv_box  = struct.pack(">I4s", 8 + len(record), box_typ) + record
+
+        moov[einfuege_pos:einfuege_pos] = dv_box
 
         for soff in [0] + groessen_offs:
             alt = struct.unpack_from(">I", moov, soff)[0]
-            struct.pack_into(">I", moov, soff, alt + 16)
+            struct.pack_into(">I", moov, soff, alt + len(dv_box))
 
         with open(mp4_pfad, "r+b") as f:
             f.seek(moov_off)
@@ -309,8 +340,13 @@ def _moov_enthaelt(mp4_pfad: Path, signatur: bytes) -> bool:
 
 
 def _dvcc_vorhanden(mp4_pfad: Path) -> bool:
-    """Prüft ob eine dvcC-Box in der MP4-Datei vorhanden ist (schnelle Byte-Suche im moov)."""
-    return _moov_enthaelt(mp4_pfad, b"dvcC")
+    """
+    Prüft ob eine Dolby-Vision-Konfigurationsbox in der MP4 vorhanden ist
+    (schnelle Byte-Suche im moov). Es zählen beide Boxnamen: ffmpeg schreibt
+    bei HEVC-DV-Profil 8 im hvc1-Entry selbst eine dvvC-Box – wird nur auf
+    dvcC geprüft, landet eine überflüssige zweite Box in der Datei.
+    """
+    return any(_moov_enthaelt(mp4_pfad, name) for name in DV_BOX_TYPEN)
 
 
 def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,

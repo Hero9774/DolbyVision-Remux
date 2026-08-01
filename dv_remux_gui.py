@@ -1,8 +1,65 @@
 """
-dv_remux_gui.py  v5.8.0
+dv_remux_gui.py  v5.9.0
 =======================
 GUI tool: Dolby Vision MKV → MP4 remux + SRT subtitle extraction
 For Jellyfin / LG TV
+
+New in v5.9.0:
+  • Fixed: duplicate Dolby Vision configuration box. Current ffmpeg versions
+    write a correct dvvC box themselves when muxing HEVC DV profile 8, but
+    the presence check only looked for "dvcC" – so a second configuration
+    box was injected into the same sample entry. Both names now count.
+  • Fixed: the injected record was 8 bytes of payload instead of the
+    required 24 (box 16 instead of 32 bytes) and was therefore malformed.
+    It now matches byte for byte what ffmpeg writes, and it is named dvvC
+    in hvc1/hev1 entries and dvcC in dvh1/dvhe entries, as the Dolby
+    ISOBMFF specification requires.
+  • Anamorphic sources (sample aspect ratio ≠ 1:1, e.g. 3840x2080 with SAR
+    481:480) are corrected with -aspect, which rewrites only the container's
+    pasp box – ffprobe, and therefore Jellyfin, gives it precedence over the
+    VUI. Jellyfin otherwise refuses direct playback with "anamorphic video is
+    not supported". Only applied when the deviation is at most 1 %; stronger
+    anamorphic material (e.g. PAL DVD with SAR 16:15) is left untouched with a
+    warning, since correcting it there would visibly distort the picture.
+    NOTE: do not replace this with "-bsf:v hevc_metadata=sample_aspect_ratio
+    =1/1". That filter re-serializes VPS/SPS/PPS, after which the Dolby Vision
+    RPU no longer matches the parameter sets: ffmpeg still decodes the file,
+    but the picture falls apart into colour smears on the TV (verified on an
+    LG G4). The container route leaves every parameter set and RPU untouched.
+  • DTS → E-AC3 (new toggle, on by default): ffmpeg can only store DTS inside
+    MP4 as an mp4a sample entry with an esds descriptor – a proper dtsc entry
+    is rejected by the muxer. Hardware players do not recognize that and
+    refuse the entire file, even models that do support DTS (verified on an
+    LG G4: the same file with E-AC3 plays fine, including Dolby Vision).
+    Affected tracks are therefore converted to E-AC3 640k; every other audio
+    track is still copied unchanged, as is the video.
+  • Video converter (sub-program, button "🎬 Video converter" in the main
+    window): scans a folder for video files, determines the resolution of
+    each one and converts everything that is not already an MP4 into an
+    LG-TV-friendly MP4 – in its own window with its own queues, stop event
+    and log, so it runs independently of the remux run. All paths (source,
+    working folder, backup folder, ffmpeg) are shared with the main window.
+    MKV files are ignored here; they belong to the remux part.
+    Uses the AMD AMF hardware encoder (hevc_amf / h264_amf) when available;
+    availability is verified with a real one-second test encode at start
+    instead of trusting "ffmpeg -encoders", and falls back to libx265/libx264
+    per file if the hardware encoder refuses a source.
+    Output profile: HEVC Main + hvc1 tag by default (H.264 High selectable),
+    yuv420p, AAC audio (copy when the source is already AAC),
+    -movflags +faststart and a fixed 2-second keyframe interval so seeking
+    and fast-forward work on the TV. Rate control uses a target bitrate
+    (peak VBR, 4 Mbit/s for 1080p25 HEVC at "medium", scaled by resolution
+    and frame rate) rather than a constant quantizer, under which noisy old
+    sources can end up larger than the original.
+    The source resolution is preserved; anamorphic material (SAR ≠ 1:1,
+    typical for MPEG/DVD/WMV) is rescaled to square pixels, and interlaced
+    sources are deinterlaced (yadif), since AMF only encodes progressively.
+    Like the remux pipeline, the conversion runs in the local working folder:
+    the original is moved there, converted, only the finished MP4 is moved
+    back to the source folder, and the original is deleted afterwards. If
+    anything fails – encode error, failed transfer back, stop button – the
+    original is moved back to its source location automatically.
+    Existing MP4 targets and unknown file types are skipped and logged.
 
 New in v5.8.0:
   • Multilingual support (German/English): dropdown in the title bar,

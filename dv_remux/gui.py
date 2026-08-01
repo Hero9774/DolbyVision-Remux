@@ -109,11 +109,13 @@ class App(tk.Tk):
         self.var_embed_subs     = tk.BooleanVar(value=self.cfg.get("embed_subs",     False))
         self.var_old_mkv_modus  = tk.StringVar(value=self.cfg.get("old_mkv_modus",  "lokal"))
         self.var_old_mkv_pfad   = tk.StringVar(value=self.cfg.get("old_mkv_pfad",   ""))
+        self.var_dts_eac3          = tk.BooleanVar(value=self.cfg.get("dts_eac3",          True))
         self.var_lokale_kopie      = tk.BooleanVar(value=self.cfg.get("lokale_kopie",      False))
         self.var_lokale_kopie_pfad = tk.StringVar(
             value=self.cfg.get("lokale_kopie_pfad") or tempfile.gettempdir())
         self.var_autoscroll     = tk.BooleanVar(value=True)
         self.stopp_event    = threading.Event()
+        self.konverter_fenster = None   # Unterprogramm Video-Konverter (Toplevel)
 
         self._stil()
         self._gui()
@@ -158,6 +160,7 @@ class App(tk.Tk):
         self.btn_stopp.configure(text=t("gui.btn_stopp"))
         self.btn_log.configure(text=t("gui.btn_log_open"))
         self.btn_log_leeren.configure(text=t("gui.btn_log_clear"))
+        self.btn_konverter.configure(text=t("gui.btn_konverter"))
         self.task_film_lbl.configure(text=t("gui.task_film"))
         self.task_schritt_lbl.configure(text=t("gui.task_schritt"))
         self.task_status_lbl.configure(text=t("gui.task_status"))
@@ -176,6 +179,11 @@ class App(tk.Tk):
         self._modus_update()
         self._ffbin_status_update()
         self._dovi_status_update()
+
+        # Offenes Unterprogramm-Fenster mitziehen
+        konv = self.konverter_fenster
+        if konv is not None and konv.winfo_exists():
+            konv._sprache_anwenden()
 
     def _auto_ffbin(self) -> str:
         """
@@ -395,15 +403,19 @@ class App(tk.Tk):
             (self.var_subs,         "gui.opt_subs_srt"),
             (self.var_embed_subs,   "gui.opt_subs_embed"),
             (self.var_nfo,          "gui.opt_nfo_update"),
+            (self.var_dts_eac3,     "gui.opt_dts_eac3"),
             (self.var_lokale_kopie, "gui.opt_local_copy"),
         ]
+        tipps = {id(self.var_lokale_kopie): "gui.opt_local_copy_tip",
+                 id(self.var_dts_eac3):     "gui.opt_dts_eac3_tip"}
         for var, label_key in opt_defs:
             btn = ttk.Button(opt, text=t(label_key),
                              command=lambda v=var: self._toggle_opt(v))
             btn.pack(side="left", padx=(0,6))
             self._opt_btns[id(var)] = (btn, var, label_key)
-            if var is self.var_lokale_kopie:
-                _Tooltip(btn, lambda: t("gui.opt_local_copy_tip"),
+            tipp = tipps.get(id(var))
+            if tipp:
+                _Tooltip(btn, lambda k=tipp: t(k),
                          bg=self.PANEL2, fg=self.TEXT, border=self.BORDER)
 
         # ── Zeile 6: Sicherungsordner ─────────────────────────────────────
@@ -483,6 +495,13 @@ class App(tk.Tk):
             bf, text=f"{t('gui.on_prefix')}{t('gui.autoscroll')}", style="ToggleOn.TButton",
             command=self._toggle_autoscroll)
         self.btn_autoscroll.pack(side="left", padx=(8,0))
+        # Unterprogramm: Video-Konverter (eigenes Fenster, läuft unabhängig)
+        self.btn_konverter = ttk.Button(
+            bf, text=t("gui.btn_konverter"), style="Log.TButton",
+            command=self._konverter_oeffnen)
+        self.btn_konverter.pack(side="right")
+        _Tooltip(self.btn_konverter, lambda: t("gui.btn_konverter_tip"),
+                 bg=self.PANEL2, fg=self.TEXT, border=self.BORDER)
 
         # ── Status-Zeile (eigene Reihe, damit sie nicht von Buttons überlagert wird)
         status_frame = ttk.Frame(self)
@@ -585,9 +604,18 @@ class App(tk.Tk):
         self.btn_stopp.configure(state="disabled")
         self.status_lbl.configure(text=t("gui.status_cancelling"), fg=self.YELLOW)
 
+    # ─── Video-Konverter (Unterprogramm) ──────────────────────────────────────
+    def _konverter_oeffnen(self):
+        # Lazy-Import: konverter_gui greift seinerseits auf dieses Modul zu
+        from dv_remux.konverter_gui import oeffne_konverter
+        oeffne_konverter(self)
+
     # ─── Config als dict (für config_speichern) ────────────────────────────────
     def _config_dict(self) -> dict:
-        return {
+        # Auf der geladenen Config aufbauen, damit Keys anderer Fenster
+        # (z. B. die konv_*-Einstellungen des Video-Konverters) erhalten bleiben.
+        daten = dict(self.cfg)
+        daten.update({
             "ffbin":          self.var_ffbin.get(),
             "root":           self.var_root.get(),
             "behalten":       self.var_behalten.get(),
@@ -595,16 +623,20 @@ class App(tk.Tk):
             "nfo":            self.var_nfo.get(),
             "modus":          self.var_modus.get(),
             "embed_subs":     self.var_embed_subs.get(),
+            "dts_eac3":       self.var_dts_eac3.get(),
             "old_mkv_modus":  self.var_old_mkv_modus.get(),
             "old_mkv_pfad":   self.var_old_mkv_pfad.get(),
             "lokale_kopie":      self.var_lokale_kopie.get(),
             "lokale_kopie_pfad": self.var_lokale_kopie_pfad.get(),
             "sprache":        self.var_sprache.get(),
-        }
+        })
+        return daten
 
     # ─── Schließen (X-Button + Schließen-Button) ──────────────────────────────
     def _schliessen(self):
-        if self.läuft:
+        konv = self.konverter_fenster
+        konv_laeuft = bool(konv is not None and konv.winfo_exists() and konv.laeuft)
+        if self.läuft or konv_laeuft:
             antwort = messagebox.askyesno(
                 t("gui.close_confirm_title"),
                 t("gui.close_confirm_message"),
@@ -614,6 +646,8 @@ class App(tk.Tk):
             if not antwort:
                 return
             self.stopp_event.set()
+            if konv_laeuft:
+                konv.stopp_event.set()
         config_speichern(self._config_dict())
         self.destroy()
 
@@ -897,6 +931,7 @@ class App(tk.Tk):
                 old_mkv_global,
                 self.var_lokale_kopie.get(),
                 lokale_kopie_pfad_obj,
+                self.var_dts_eac3.get(),
             ),
             daemon=True
         ).start()
