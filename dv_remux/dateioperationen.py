@@ -19,6 +19,24 @@ def genug_speicherplatz(ordner: Path, benoetigte_bytes: int,
     return frei >= benoetigte_bytes * puffer
 
 
+def _gleicher_pfad(a: Path, b: Path) -> bool:
+    """
+    True wenn beide Pfade auf dieselbe Datei zeigen. Schützt Kopier-/Verschiebe-
+    Operationen davor, die Quelle mit sich selbst zu überschreiben.
+    """
+    try:
+        if a.resolve() == b.resolve():
+            return True
+    except OSError:
+        pass
+    try:
+        if a.exists() and b.exists() and a.samefile(b):
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def kopiere_mit_fortschritt(quelle: Path, ziel: Path, beschreibung: str,
                              log_q: queue.Queue, task_q: queue.Queue,
                              simulation: bool, log_zeilen: list,
@@ -32,6 +50,13 @@ def kopiere_mit_fortschritt(quelle: Path, ziel: Path, beschreibung: str,
         text = t("copy.sim", beschreibung=beschreibung, quelle=quelle.name, ziel=ziel)
         log_q.put(("SIM", text))
         log_zeilen.append(_bereinige_log(text))
+        task_q.put({"schritt": beschreibung, "sub_prog": 100})
+        return True
+
+    # Quelle == Ziel: open(ziel, "wb") würde die Datei trunkieren BEVOR gelesen
+    # wird -> Totalverlust. Kann passieren, wenn der lokale Arbeitsordner mit
+    # dem Quellordner übereinstimmt.
+    if _gleicher_pfad(quelle, ziel):
         task_q.put({"schritt": beschreibung, "sub_prog": 100})
         return True
 
@@ -86,6 +111,12 @@ def verschiebe_sicher(quelle: Path, ziel: Path, beschreibung: str,
         task_q.put({"schritt": beschreibung, "sub_prog": 100})
         return True
 
+    # Quelle == Ziel: nichts zu verschieben. Ohne diesen Guard würde die Datei
+    # beim Kopieren auf 0 Byte trunkiert und anschließend gelöscht.
+    if _gleicher_pfad(quelle, ziel):
+        task_q.put({"schritt": beschreibung, "sub_prog": 100})
+        return True
+
     quelle_groesse = quelle.stat().st_size
     if not kopiere_mit_fortschritt(quelle, ziel, beschreibung, log_q, task_q,
                                     simulation, log_zeilen, stopp_event=stopp_event):
@@ -114,13 +145,22 @@ def verschiebe_oder_loesche_mkv(mkv_pfad: Path, original_behalten: bool,
                                 simulation: bool, log_func,
                                 undo_log: list = None,
                                 old_mkv_global_pfad: Path = None,
-                                aktueller_pfad: Path = None) -> None:
+                                aktueller_pfad: Path = None,
+                                log_q: queue.Queue = None,
+                                task_q: queue.Queue = None,
+                                log_zeilen: list = None,
+                                stopp_event=None) -> None:
     """
     MKV nach erfolgreichem Remux verschieben oder löschen.
     aktueller_pfad: wo die Datei GERADE liegt (z. B. lokaler Arbeitsordner bei
     aktivierter lokaler Kopie); Default = mkv_pfad (unverändertes Verhalten).
     mkv_pfad bleibt in jedem Fall die NAS-Referenz für Zielordner-Namen und
     Undo-Ursprungspfad.
+    Sind log_q/task_q/log_zeilen gesetzt, läuft das Verschieben über
+    verschiebe_sicher() – mit Fortschrittsanzeige und abbrechbar. Das ist wichtig,
+    wenn Quelle (lokaler Arbeitsordner) und Ziel (NAS) auf verschiedenen
+    Laufwerken liegen: shutil.move() kopiert dann blockierend und ohne
+    Rückmeldung mehrere GB.
     """
     quelle = aktueller_pfad or mkv_pfad
     if original_behalten:
@@ -138,7 +178,18 @@ def verschiebe_oder_loesche_mkv(mkv_pfad: Path, original_behalten: bool,
         else:
             try:
                 ziel_ordner.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(quelle), str(ziel_pfad))
+                if log_q is not None and task_q is not None and log_zeilen is not None:
+                    erfolg = verschiebe_sicher(
+                        quelle, ziel_pfad, t("mkvmove.step_move"),
+                        log_q, task_q, False, log_zeilen,
+                        stopp_event=stopp_event)
+                else:
+                    shutil.move(str(quelle), str(ziel_pfad))
+                    erfolg = True
+                if not erfolg:
+                    log_func("ERR", t("mkvmove.move_failed",
+                                      fehler=t("mkvmove.move_aborted")))
+                    return
                 log_func("OK", t("mkvmove.moved", ziel=ziel_label))
                 if undo_log is not None:
                     undo_log.append({"typ": "mkv_move",

@@ -12,11 +12,13 @@ python dv_remux_gui.py
 
 ## Zweck
 
-`dv_remux_gui.py` (aktuell **v5.0**, Docstring v5) ist ein GUI-Tool zum Batch-Remux von **Dolby Vision MKV → MP4** (ohne Re-Encoding) für Jellyfin / LG TV. Es verarbeitet automatisch alle Unterordner eines Root-Verzeichnisses.
+`dv_remux_gui.py` ist nur der Einstiegspunkt; die Logik liegt im Paket `dv_remux/`.
+Die Version steht an **einer** Stelle: `konstanten.py` → `VERSION` (aktuell **5.9.1**).
 
-Zwei Betriebsmodi (Radiobutton in der GUI, Config-Key `"modus"`):
+Drei Betriebsmodi (Toggle-Buttons in der GUI, Config-Key `"modus"`):
 - **`"filme"`** – ein MKV pro Unterordner, steuert `verarbeite_sammlung()`
-- **`"serien"`** – rekursive Staffel/Episode-Struktur, steuert `verarbeite_serien()`; überspringt Trickplay-Ordner (`trickplay` im Pfad)
+- **`"serien"`** – Show/Staffel/Episode-Struktur, steuert `verarbeite_serien()`; überspringt Trickplay-Ordner (`trickplay` im Pfad). Ein Ordner zählt auch dann als Staffel, wenn er selbst MKVs enthält
+- **`"ordner"`** – genau ein Film-Ordner, steuert `verarbeite_einzelordner()`
 
 ## Dolby-Vision-Box und anamorphe Quellen (Stolperfallen)
 
@@ -46,6 +48,17 @@ Zwei Betriebsmodi (Radiobutton in der GUI, Config-Key `"modus"`):
   → E-AC3 640k pro betroffener Spur, alle anderen bleiben `copy`.
 - Ein MP4→MP4-Remux verliert die DV-Signalisierung: Reparaturen immer aus der
   Original-MKV fahren.
+- **`injiziere_dvcc_box()` setzt moov am Dateiende voraus** und prüft das seit
+  v5.9.1 auch. Sie schreibt moov an seine alte Position und ruft `truncate()` –
+  auf einer bereits gefaststarteten MP4 wäre das Video danach weg. Reihenfolge
+  ist also immer: muxen ohne `+faststart` → injizieren → `mache_faststart_und_ftyp()`.
+- **Dateien niemals mit `unlink()` + `rename()` ersetzen**, immer `os.replace()`.
+  Unter Windows schlägt das Rename regelmäßig fehl (Virenscanner/Explorer halten
+  die frische Datei kurz offen, `WinError 32`); zwischen beiden Aufrufen existiert
+  sonst nur die Temp-Kopie, die der Fehlerpfad dann mitlöscht.
+- **`kopiere_mit_fortschritt()` / `verschiebe_sicher()` prüfen auf Quelle == Ziel.**
+  `open(ziel, "wb")` trunkiert vor dem Lesen; ohne die Prüfung wäre die Datei
+  bei identischen Pfaden weg.
 
 ## Unterprogramm: Video-Konverter
 
@@ -62,7 +75,14 @@ Hauptfensters (`remuxed`/`fehler`) und die des Konverters
 - Encoder-Wahl: `ermittle_encoder()` prüft AMF **mit echtem 1-Sekunden-Testencode**
   (`-encoders` beweist nur Compile-Zeit-Support) und cached das Ergebnis;
   Fallback-Kette pro Datei: HW mit Subs → HW ohne Subs → `libx264`/`libx265`
-- Ziel-Codec-Vorgabe ist **HEVC**; Ratenkontrolle über Zielbitrate
+- Zielcodec: nur **`h264`** oder **`hevc`** (`CODEC_WERTE` in konverter.py),
+  Vorgabe `hevc`. `waehle_ziel_codec()` entscheidet nur noch dann nach Auflösung,
+  wenn in der Config ein unbekannter Wert steht (Migration von altem `"auto"`)
+- Info-Button (ℹ) im Konverter-Fenster: der Text steht als Zeilenliste in den
+  Sprachdateien unter `konvgui.info_1`, `konvgui.info_2` … – `_info_dialog()`
+  liest hoch, bis ein Key fehlt. Zeilen mit `# ` am Anfang werden Überschriften.
+  **Beide Sprachdateien müssen gleich viele info_-Keys haben** (Konsistenzcheck)
+- Ratenkontrolle über Zielbitrate
   (`berechne_bitrate()`, Peak-VBR) statt CQP – bei konstantem Quantizer werden
   verrauschte alte Quellen sonst größer als das Original
 - Ausgabe: HEVC + `hvc1` bzw. H.264 High, `yuv420p`, AAC (Copy wenn Quelle schon AAC),
@@ -92,8 +112,16 @@ HDR-Typ-Prüfung: primär aus `movie.nfo` (`lese_hdrtype_aus_nfo()`), alternativ
 
 ## Threading-Modell
 
+**Alle drei Remux-Worker laufen durch `_worker_rahmen()`** (worker.py). Der Rahmen
+legt `log_zeilen`/`stats`/`log()` an, ruft die `_..._impl()`-Funktion und garantiert
+im `finally` genau **ein** `done_q`-Signal – auch bei unerwarteter Exception. Ohne das
+stirbt der Thread stumm und die GUI wartet ewig (Start-Button bleibt deaktiviert).
+Deshalb: in den Impl-Funktionen **niemals** selbst `done_q.put()` aufrufen oder
+`schreibe_log_datei()` starten; ein einfaches `return` genügt. Der Konverter macht
+dasselbe mit einem eigenen `try/except/finally` in `verarbeite_videoordner()`.
+
 4 Queues für die GUI-Kommunikation:
-- `log_queue` – farbige Log-Einträge (`"OK"`, `"ERR"`, `"SIM"`, `"SKIP"`, `"PROG"`, `"HEAD"`)
+- `log_queue` – farbige Log-Einträge (`"OK"`, `"ERR"`, `"SIM"`, `"SKIP"`, `"PROG"`, `"HEAD"`, `"INFO"`, `"WARN"`, `"FOLDER"`)
 - `task_queue` – aktueller Film/Schritt/Sub-Fortschritt (`{"film": ..., "schritt": ..., "sub_prog": ...}`)
 - `fort_queue` – Gesamt-Fortschritt 0–100
 - `done_queue` – Ergebnis-Stats + Log-Pfad am Ende
@@ -102,27 +130,38 @@ Die GUI polt alle Queues via `self.after()` (`_poll()`-Methode) – kein direkte
 
 ## Simulationsmodus
 
-Im Simulationsmodus (`var_sim = True`):
-- ffmpeg/ffprobe werden nicht aufgerufen
+Simulation ist **kein** Config-Key, sondern ein Parameter der Start-Buttons
+(`App._starten(simulation=True)`).
+
+- ffmpeg wird nicht aufgerufen. **ffprobe schon** – die HDR-Erkennung läuft auch
+  hier, deshalb prüft `_starten()` die Existenz von ffprobe auch in der Simulation.
+  Fehlt sie, gilt jeder Film als "kein Dolby Vision" und der Lauf meldet 0 Treffer
+- Es wird **keine** Datei und **kein** Ordner geschrieben (auch der Arbeitsordner
+  wird nicht angelegt)
 - Untertitel-Streams werden aus der NFO gelesen (`simuliere_streams_aus_nfo()`)
 - Alle Aktionen werden als `[SIM]`-Einträge geloggt
 - Log-Dateien bekommen das Suffix `_SIM_`
 
 ## Konfiguration
 
-`dv_remux_config.json` – wird beim Start geladen und beim Schließen gespeichert:
+`config/dv_remux_config.json` (Pfad aus `konstanten.CONFIG_DATEI`) – wird beim Start
+geladen und beim Schließen gespeichert. `config_speichern()` schreibt **atomar**
+(Temp-Datei + `os.replace()`); eine beschädigte Datei wird beim Laden nach `.bak`
+umbenannt statt still verworfen.
+
 ```json
 {
   "ffbin":      "C:/ffmpeg/bin",   // Ordner mit ffmpeg.exe + ffprobe.exe
   "root":       "Y:/Shared Movies",// Root-Verzeichnis
-  "sim":        true,              // Simulationsmodus
-  "behalten":   true,              // Original-MKV nach Remux behalten
+  "behalten":   true,              // Original-MKV nach Remux sichern
   "subs":       false,             // Untertitel als externe .srt extrahieren
   "nfo":        true,              // movie.nfo aktualisieren
-  "modus":      "filme",           // "filme" | "serien"
-  "embed_subs": false              // Untertitel in MP4 einbetten
+  "modus":      "filme",           // "filme" | "serien" | "ordner"
+  "embed_subs": false,             // Untertitel in MP4 einbetten
+  "sprache":    "de"               // "de" | "en"
 }
 ```
+Vollständiges Beispiel inkl. der `konv_*`-Keys: `dv_remux_config.example.json`.
 
 ## Ordner-Struktur (erwartet)
 
@@ -142,7 +181,9 @@ Root/
 
 ## Rollback / Undo
 
-Jeder Worker baut eine `undo_log`-Liste auf (Einträge mit `{"typ": "mp4"|"srt"|"nfo", "pfad": ...}`). Bei Abbruch oder Fehler ruft `rollback_session()` die Liste ab und löscht/stellt erstellte Dateien wieder her.
+Jeder Worker baut eine `undo_log`-Liste auf (Einträge mit `{"typ": "mp4"|"srt"|"nfo", "pfad": ...}`). `rollback_session()` wird **nur bei gesetztem `stopp_event`** aufgerufen (Benutzer-Abbruch), nicht bei einem Fehler in einer einzelnen Datei – dort räumt der jeweilige `finally`-Block auf und schiebt die Original-MKV aus dem Arbeitsordner an ihren Ursprungsort zurück.
+
+Deshalb wartet `App._schliessen()` per `_warte_auf_ende()` auf das Ende des Threads, statt sofort `destroy()` zu rufen: die Worker sind `daemon=True` und würden sonst mitten im Rollback hart abgebrochen.
 
 ## GUI-Architektur
 

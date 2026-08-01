@@ -24,7 +24,7 @@ def konvertiere_dv_p5_zu_p8(
         mkv_pfad: Path, mp4_pfad: Path,
         log_q: queue.Queue, task_q: queue.Queue,
         simulation: bool, log_zeilen: list,
-        stopp_event=None) -> bool:
+        stopp_event=None, dts_zu_eac3: bool = False) -> bool:
     """
     DV Profil 5 (ICtCp) → Profil 8.1 (HDR10-kompatibel) ohne Re-Encoding:
       Schritt 1: HEVC-Stream extrahieren (ffmpeg -c:v copy)
@@ -77,6 +77,7 @@ def konvertiere_dv_p5_zu_p8(
                 text = t("p5p8.abgebrochen")
                 log_q.put(("WARN", text))
                 log_zeilen.append(_bereinige_log(text))
+                mp4_pfad.unlink(missing_ok=True)
                 return False
             zeile = zeile.rstrip()
             if "Duration:" in zeile and dauer_sek is None:
@@ -159,7 +160,8 @@ def konvertiere_dv_p5_zu_p8(
             s_info = json.loads(subprocess.run(
                 [str(ffprobe), "-v", "quiet", "-print_format", "json",
                  "-show_streams", "-select_streams", "v:0", str(mkv_pfad)],
-                capture_output=True, text=True, timeout=30).stdout
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30).stdout
             ).get("streams", [{}])[0]
             breite  = int(s_info.get("width",  3840))
             hoehe   = int(s_info.get("height", 2160))
@@ -178,23 +180,51 @@ def konvertiere_dv_p5_zu_p8(
         # Audio: alle kompatiblen Spuren aus Original-MKV (TrueHD ausschließen)
         alle_audio = ermittle_audio_streams(ffprobe, mkv_pfad)
         kompatible = [s["index"] for s in alle_audio if s["codec"] != "truehd"]
-        audio_indizes = kompatible if kompatible else [s["index"] for s in alle_audio]
-        if len(kompatible) < len(alle_audio):
-            ausgelassen = len(alle_audio) - len(kompatible)
-            text = t("p5p8.truehd_excluded", anzahl=ausgelassen)
-            log_q.put(("WARN", text))
-            log_zeilen.append(_bereinige_log(text))
+        if kompatible:
+            audio_indizes = kompatible
+            if len(kompatible) < len(alle_audio):
+                text = t("p5p8.truehd_excluded",
+                         anzahl=len(alle_audio) - len(kompatible))
+                log_q.put(("WARN", text))
+                log_zeilen.append(_bereinige_log(text))
+        else:
+            # Es gibt gar keine MP4-taugliche Spur -> alle mappen und warnen.
+            # Vorher wurde hier "n Spuren ausgelassen" gemeldet, obwohl keine
+            # ausgelassen wurde – die Meldung führte bei der Fehlersuche in die Irre.
+            audio_indizes = [s["index"] for s in alle_audio]
+            if alle_audio:
+                text = t("p5p8.truehd_only")
+                log_q.put(("WARN", text))
+                log_zeilen.append(_bereinige_log(text))
 
         audio_maps = []
         for idx in audio_indizes:
             audio_maps += ["-map", f"1:{idx}"]
 
+        # DTS ist im MP4-Container nur als mp4a/esds darstellbar; Hardware-Player
+        # verweigern dann die GANZE Datei. Derselbe Fix wie in remux_zu_mp4().
+        audio_codec_args3 = []
+        if dts_zu_eac3:
+            gemappt3 = [s for s in alle_audio if s["index"] in audio_indizes]
+            audio_codec_args3, anzahl_dts3 = dts_audio_argumente(gemappt3)
+            if anzahl_dts3:
+                text = t("remux.dts_zu_eac3", anzahl=anzahl_dts3, bitrate=EAC3_BITRATE)
+                log_q.put(("INFO", text))
+                log_zeilen.append(_bereinige_log(text))
+
         # Anamorphe Quelle auch hier normalisieren (siehe anamorph_argumente)
-        anamorph3, status3 = anamorph_argumente(
-            ermittle_video_geometrie(ffprobe, mkv_pfad))
-        if status3 == "fix":
-            text = t("p5p8.anamorph_fix")
-            log_q.put(("INFO", text))
+        geometrie3 = ermittle_video_geometrie(ffprobe, mkv_pfad)
+        anamorph3, status3 = anamorph_argumente(geometrie3)
+        if status3:
+            # Auch "zu_stark" melden – sonst bleibt die MP4 anamorph, Jellyfin
+            # verweigert Direct Play und im Log steht kein Hinweis darauf.
+            schluessel3 = {"fix": "p5p8.anamorph_fix",
+                           "zu_stark": "p5p8.anamorph_zu_stark"}[status3]
+            sar3 = geometrie3.get("sar", (1, 1))
+            text = t(schluessel3, sar=f"{sar3[0]}:{sar3[1]}",
+                     breite=geometrie3.get("breite", 0),
+                     hoehe=geometrie3.get("hoehe", 0))
+            log_q.put(("INFO" if status3 == "fix" else "WARN", text))
             log_zeilen.append(_bereinige_log(text))
 
         # Kein -movflags +faststart: moov landet am Ende → dvcC-Injektion
@@ -204,7 +234,7 @@ def konvertiere_dv_p5_zu_p8(
                     "-i", str(mkv_pfad)]
                    + ["-map", "0:v:0"] + audio_maps
                    + ["-c", "copy", "-strict", "unofficial",
-                      "-tag:v", "dvh1"] + anamorph3
+                      "-tag:v", "dvh1"] + audio_codec_args3 + anamorph3
                    + ["-y", str(mp4_pfad)])
 
         proc = subprocess.Popen(befehl3, stderr=subprocess.PIPE,
@@ -218,6 +248,7 @@ def konvertiere_dv_p5_zu_p8(
                 text = t("p5p8.abgebrochen")
                 log_q.put(("WARN", text))
                 log_zeilen.append(_bereinige_log(text))
+                mp4_pfad.unlink(missing_ok=True)
                 return False
             zeile = zeile.rstrip()
             stderr_z3.append(zeile)
@@ -248,6 +279,7 @@ def konvertiere_dv_p5_zu_p8(
             text = t("p5p8.step3_failed")
             log_q.put(("ERR", text))
             log_zeilen.append(_bereinige_log(text))
+            mp4_pfad.unlink(missing_ok=True)   # halbfertige Datei nicht liegen lassen
             return False
 
         # ── Schritt 4: dvcC-Box injizieren ────────────────────────────────
@@ -265,6 +297,7 @@ def konvertiere_dv_p5_zu_p8(
             text = t("p5p8.step4_failed")
             log_q.put(("ERR", text))
             log_zeilen.append(_bereinige_log(text))
+            mp4_pfad.unlink(missing_ok=True)
             return False
         else:
             text = t("p5p8.step4_ok")
@@ -305,7 +338,8 @@ def extrahiere_untertitel(ffmpeg: Path, mkv_pfad: Path, streams: list,
                            log_q: queue.Queue, task_q: queue.Queue,
                            simulation: bool, log_zeilen: list,
                            undo_log: list = None,
-                           ziel_ordner: Path = None) -> list:
+                           ziel_ordner: Path = None,
+                           stopp_event=None) -> list:
     """
     Text-Untertitelspuren als .srt extrahieren.
     Gibt Liste der erfolgreich erstellten/vorhandenen SRT-Pfade zurück
@@ -316,7 +350,7 @@ def extrahiere_untertitel(ffmpeg: Path, mkv_pfad: Path, streams: list,
     """
     basis = mkv_pfad.with_suffix("")
     ziel_ordner = ziel_ordner or basis.parent
-    sprachzähler = {}
+    sprachzaehler = {}
     text_streams   = [s for s in streams if s["codec"] in TEXT_CODECS]
     bitmap_streams = [s for s in streams if s["codec"] not in TEXT_CODECS]
     erstellte_srts = []   # ← Rückgabe-Liste
@@ -328,10 +362,17 @@ def extrahiere_untertitel(ffmpeg: Path, mkv_pfad: Path, streams: list,
 
     total = len(text_streams)
     for i, stream in enumerate(text_streams):
+        # Stopp-Button auch hier auswerten – vorher lief die Schleife nach
+        # einem Abbruch stumpf über alle Spuren weiter.
+        if stopp_event and stopp_event.is_set():
+            text = t("srt.abgebrochen")
+            log_q.put(("WARN", text))
+            log_zeilen.append(_bereinige_log(text))
+            break
         sprache = stream["language"]
         idx     = stream["index"]
-        sprachzähler[sprache] = sprachzähler.get(sprache, 0) + 1
-        if sprachzähler[sprache] > 1:
+        sprachzaehler[sprache] = sprachzaehler.get(sprache, 0) + 1
+        if sprachzaehler[sprache] > 1:
             text = t("srt.duplicate_skip", sprache=sprache, idx=idx)
             log_q.put(("SKIP", text))
             log_zeilen.append(_bereinige_log(text))
@@ -340,7 +381,7 @@ def extrahiere_untertitel(ffmpeg: Path, mkv_pfad: Path, streams: list,
 
         task_q.put({
             "schritt":  f"SRT: {srt_pfad.name}",
-            "sub_prog": int(i / total * 100) if total else 0
+            "sub_prog": int(i / total * 100)
         })
 
         if srt_pfad.exists():
@@ -365,14 +406,17 @@ def extrahiere_untertitel(ffmpeg: Path, mkv_pfad: Path, streams: list,
             "-map", f"0:{idx}", "-c:s", "srt", "-y", str(srt_pfad)
         ]
         try:
-            subprocess.run(befehl, capture_output=True, check=True)
+            # timeout: ein hängender ffmpeg (defekter Stream, NAS-Timeout) würde
+            # den Worker-Thread sonst dauerhaft blockieren.
+            subprocess.run(befehl, capture_output=True, check=True, timeout=900)
             text = t("srt.ok", name=srt_pfad.name)
             log_q.put(("OK", text))
             log_zeilen.append(_bereinige_log(text))
             erstellte_srts.append(srt_pfad)
             if undo_log is not None:
                 undo_log.append({"typ": "srt", "pfad": srt_pfad})
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            srt_pfad.unlink(missing_ok=True)   # Torso nicht liegen lassen
             text = t("srt.failed", name=srt_pfad.name)
             log_q.put(("ERR", text))
             log_zeilen.append(_bereinige_log(text))
@@ -414,6 +458,7 @@ def aktualisiere_nfo(
     task_q.put({"schritt": t("nfo.taskstep_updating"), "sub_prog": None})
     text = t("nfo.updating")
     log_q.put(("INFO", text))
+    log_zeilen.append(_bereinige_log(text))
 
     # ── Backup erstellen ──────────────────────────────────────────────────
     bak_pfad = nfo_pfad.with_suffix(".nfo.bak")
@@ -451,6 +496,7 @@ def aktualisiere_nfo(
         text = t("nfo.parse_failed", fehler=e)
         log_q.put(("ERR", text))
         log_zeilen.append(_bereinige_log(text))
+        task_q.put({"schritt": t("nfo.taskstep_failed"), "sub_prog": 100})
         return
 
     aenderungen = []
@@ -508,7 +554,9 @@ def aktualisiere_nfo(
         log_zeilen.append(_bereinige_log(text))
 
     elif streamdetails is not None and not srt_dateien:
-        log_q.put(("INFO", t("nfo.subtitle_unchanged")))
+        text = t("nfo.subtitle_unchanged")
+        log_q.put(("INFO", text))
+        log_zeilen.append(_bereinige_log(text))
 
     # ── Änderungen zusammenfassen ─────────────────────────────────────────
     if not aenderungen:
@@ -802,6 +850,7 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
             # Letzte stderr-Zeilen ausgeben für Fehlerdiagnose
             text = t("remux.stderr_header")
             log_q.put(("ERR", text))
+            log_zeilen.append(_bereinige_log(text))
             for z in stderr_zeilen[-15:]:
                 if z.strip():
                     log_q.put(("ERR", f"     {z}"))

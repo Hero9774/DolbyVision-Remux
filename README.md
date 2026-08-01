@@ -225,7 +225,7 @@ It works in two phases:
 | **Process locally** | Like the remux part: the original is moved to the working folder, converted there, and only the finished MP4 goes back to the source folder. This offloads the NAS. On any error — encode failure, failed transfer back, stop button — the original is moved back to its source location automatically |
 | **Include subfolders** | Also walks all subdirectories |
 | **Keep original** | ON: the original is backed up after a successful conversion (into the main window's backup folder if that is set to *global*, otherwise into an `old video` subfolder). OFF (default): the original is deleted |
-| **Target codec** | **HEVC (default)**, H.264, or `Auto` (H.264 up to 1080p, HEVC above) |
+| **Target codec** | **H.265/HEVC (default)** or **H.264** — both via AMD AMF hardware acceleration, with an automatic software fallback per file |
 | **Quality** | High / Medium / Small — target bitrate for 1080p25 HEVC: 6 / 4 / 2.5 Mbit/s, scaled sub-linearly by resolution and frame rate, with a 1.6× surcharge for H.264 |
 
 Bitrate control (peak VBR) is used deliberately instead of a constant quantizer: noisy old sources can end up *larger* than the original at constant quality, whereas a target bitrate keeps the output size predictable.
@@ -326,7 +326,7 @@ On exit, `config/dv_remux_config.json` is saved automatically (the `config/` fol
 | `konv_behalten` | Video converter: back up the original (`false` = delete it after conversion) |
 | `konv_amd` | Video converter: use the AMD AMF hardware encoder |
 | `konv_sar` | Video converter: rescale anamorphic sources to square pixels |
-| `konv_codec` | Video converter: `"hevc"` (default) \| `"h264"` \| `"auto"` |
+| `konv_codec` | Video converter: `"hevc"` (default) \| `"h264"` |
 | `konv_qualitaet` | Video converter: `"hoch"` \| `"mittel"` \| `"klein"` |
 | `konv_lokal` | Video converter: process in the working folder instead of directly at the source |
 
@@ -433,6 +433,41 @@ When errors occur, it is always worth checking the log under `logs/`.
 ---
 
 ## Changelog
+
+### v5.9.1
+
+Bug-fix release — no new features apart from the converter's info button. Full details in `BUG_REPORT.md`.
+
+**Fixed: three ways files could be lost**
+- A copy or move whose source and target resolved to the **same path** truncated the file to zero bytes and then deleted it. Reachable by pointing the local working folder at the source folder — which the GUI now also rejects up front.
+- **DV box injection** assumed `moov` was the last top-level box but never checked. Run against an already-faststarted MP4 it overwrote `mdat` and truncated the video away — while returning success. It now refuses instead.
+- The **faststart** step deleted the original before renaming the temporary file. A failed rename (routine on Windows when a virus scanner or the Explorer briefly holds the new file) then removed the only remaining copy. Now a single atomic `os.replace()`.
+
+**Fixed: the GUI could hang forever**
+- The three remux workers had no top-level `try/except`. An unexpected exception (NAS share disappearing, `PermissionError` on `iterdir()`, `stat()` on a file just deleted) killed the thread silently, the completion signal never arrived, and Start/Simulation stayed disabled until restart. All three now share one frame that always sends exactly one `done` signal.
+- Summary and log file are written **after** each worker's own cleanup, so the "original moved back" messages reach the log file rather than only the GUI.
+- Closing the window mid-run no longer kills the worker instantly; it waits for the rollback and for the original MKV to be moved out of the working folder (with a 60-second cap so a hung ffmpeg cannot block shutdown).
+- The converter no longer sends two completion signals and no longer writes its log file twice.
+
+**Fixed: correctness**
+- **P5→P8 now converts DTS to E-AC3** as well. The toggle only affected the normal remux path, so a Profile-5 source with DTS produced a file hardware players refuse entirely.
+- P5→P8 also reports anamorphic material it deliberately does not correct; previously it stayed silent and Jellyfin refused direct play with no hint in the log.
+- A half-written MP4 is cleaned up when P5→P8 fails or is cancelled.
+- The "n TrueHD tracks skipped" warning no longer fires when *every* track is TrueHD and none was actually skipped.
+- `int | None` in `mkv_analyse.py` required Python 3.10 although 3.8+ is documented — it is evaluated on every call and crashed the worker thread.
+- The ffprobe call determining the DV level was missing `encoding="utf-8"`; an umlaut in the path made it fall back to level 6, which is wrong for 4K/50p and 4K/60p.
+- Subtitle extraction now honours the stop button and has a timeout — a hung ffmpeg used to block the worker thread indefinitely.
+- The series mode no longer skips loose episodes that sit next to a `Season xx` folder.
+- Simulation mode no longer creates directories, and it now verifies ffprobe exists — without it every movie was silently reported as "not Dolby Vision".
+- `dovi_tool` is found on Linux/macOS too (the path was hardcoded to `.exe`).
+- The config file is written atomically, and a damaged one is preserved as `.bak` instead of being silently discarded and overwritten on exit.
+- The converter's backup folder is excluded from the scan by its actual path, so already-backed-up originals are no longer picked up again on the next run.
+- Converter settings are saved when the **main** window is closed (previously they were lost).
+- Various log lines that appeared only in the GUI now also reach the log file; `ℹ` without a variation selector is no longer left raw in it.
+
+**Converter**
+- Target codec is now a straight choice between **H.264** and **H.265/HEVC**, default H.265; both run through AMD AMF. The old `Auto` option is gone (existing configs are migrated).
+- New **ℹ Info** button explaining what the converter does, in German and English.
 
 ### v5.9.0
 - **Video converter** as a sub-program in its own window (button 🎬 in the main window): scans a folder, reports every file's resolution and converts everything that is not an MP4 into an LG-TV-friendly MP4 — HEVC/H.265 by default, `.mkv` files are left to the remux part

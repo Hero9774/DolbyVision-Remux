@@ -70,13 +70,20 @@ BITRATE_BASIS = {
 }
 QUALITAET_DEFAULT = "mittel"
 
+# Auswählbare Zielcodecs im Konverter-Fenster (beide über AMD AMF beschleunigt,
+# sofern die Karte/der Treiber es hergibt – sonst automatischer Software-Fallback).
+# Reihenfolge = Reihenfolge der Buttons; erster Eintrag zuerst.
+CODEC_WERTE = ("h264", "hevc")
+CODEC_DEFAULT = "hevc"
+
 BITRATE_MIN = 900_000
 BITRATE_MAX = 25_000_000
 H264_AUFSCHLAG = 1.6      # H.264 braucht für dieselbe Qualität mehr Bitrate
 REFERENZ_PIXEL_PRO_SEK = 1920 * 1080 * 25
 
-# HEVC ab dieser Höhe (H.264 über 1080p wird von vielen TVs nicht dekodiert)
-HEVC_AB_HOEHE = 1080
+# HEVC ÜBER dieser Höhe (H.264 über 1080p wird von vielen TVs nicht dekodiert).
+# Bei exakt 1080 bleibt es bei H.264 – daher "ueber" und nicht "ab".
+HEVC_UEBER_HOEHE = 1080
 
 # Encoder-Kandidaten je Ziel-Codec: (Name, ist_hardware)
 ENCODER_KANDIDATEN = {
@@ -281,10 +288,14 @@ def berechne_bitrate(breite: int, hoehe: int, fps: float,
 
 
 def waehle_ziel_codec(info: dict, wunsch: str) -> str:
-    """'auto' → H.264 bis 1080p, darüber HEVC. Sonst der gewünschte Codec."""
-    if wunsch in ("h264", "hevc"):
+    """
+    Den Zielcodec bestimmen. Normalfall: der in der GUI gewählte Codec
+    ("h264" oder "hevc"). Nur wenn dort etwas Unbekanntes steht (alte Config
+    mit "auto"), wird nach Auflösung entschieden: H.264 bis 1080p, darüber HEVC.
+    """
+    if wunsch in CODEC_WERTE:
         return wunsch
-    return "hevc" if info["hoehe"] > HEVC_AB_HOEHE or info["breite"] > 1920 else "h264"
+    return "hevc" if info["hoehe"] > HEVC_UEBER_HOEHE or info["breite"] > 1920 else "h264"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,7 +382,7 @@ def konvertiere_datei(ffmpeg: Path, quelle: Path, ziel: Path, info: dict,
                       log_q: queue.Queue, task_q: queue.Queue,
                       log_zeilen: list, stopp_event=None,
                       mit_subs: bool = True, sw_fallback_erlaubt: bool = True,
-                      ffmpeg_sw_encoder: dict = None) -> bool:
+                      sw_encoder: dict = None) -> bool:
     """
     Eine Datei konvertieren, mit Fortschritt und abgestufter Fehlerbehandlung:
     Untertitel raus → Software-Encoder → aufgeben.
@@ -443,18 +454,18 @@ def konvertiere_datei(ffmpeg: Path, quelle: Path, ziel: Path, info: dict,
                                      log_zeilen, stopp_event,
                                      mit_subs=False,
                                      sw_fallback_erlaubt=sw_fallback_erlaubt,
-                                     ffmpeg_sw_encoder=ffmpeg_sw_encoder)
+                                     sw_encoder=sw_encoder)
 
         # Stufe 2: Hardware-Encoder scheitert an dieser Datei → Software
-        if encoder["hw"] and sw_fallback_erlaubt and ffmpeg_sw_encoder \
-                and ffmpeg_sw_encoder.get("name"):
-            _log("WARN", t("konv.retry_software", encoder=ffmpeg_sw_encoder["name"]))
+        if encoder["hw"] and sw_fallback_erlaubt and sw_encoder \
+                and sw_encoder.get("name"):
+            _log("WARN", t("konv.retry_software", encoder=sw_encoder["name"]))
             return konvertiere_datei(ffmpeg, quelle, ziel, info,
-                                     ffmpeg_sw_encoder, qualitaet,
+                                     sw_encoder, qualitaet,
                                      sar_korrigieren, log_q, task_q, log_zeilen,
                                      stopp_event, mit_subs=False,
                                      sw_fallback_erlaubt=False,
-                                     ffmpeg_sw_encoder=None)
+                                     sw_encoder=None)
 
         rc = proc.returncode
         if rc > 0x7FFFFFFF:
@@ -503,18 +514,34 @@ def schreibe_konverter_log(log_zeilen: list, simulation: bool) -> Path:
 # Worker
 # ─────────────────────────────────────────────────────────────────────────────
 
-def sammle_dateien(ordner: Path, rekursiv: bool) -> tuple:
+def _liegt_unter(pfad: Path, ordner: Path) -> bool:
+    """True wenn pfad innerhalb von ordner liegt (auch mehrere Ebenen tief)."""
+    try:
+        pfad.resolve().relative_to(ordner.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def sammle_dateien(ordner: Path, rekursiv: bool,
+                   ausgeschlossen=()) -> tuple:
     """
     Ordnerinhalt sortieren in (kandidaten, schon_mp4, mkvs, unbekannt).
     kandidaten = Videodateien mit bekannter Nicht-MP4-Endung.
-    Der Arbeits-/Sicherungsordner wird dabei ausgelassen.
+    Der Arbeits-/Sicherungsordner wird dabei ausgelassen – sowohl anhand der
+    Standardnamen als auch anhand der tatsächlich konfigurierten Pfade
+    (ausgeschlossen). Ohne Letzteres würden bereits gesicherte Originale beim
+    nächsten Lauf erneut gefunden und konvertiert.
     """
     muster = ordner.rglob("*") if rekursiv else ordner.glob("*")
+    tabu = [Path(a) for a in ausgeschlossen if a]
     kandidaten, schon_mp4, mkvs, unbekannt = [], [], [], []
     for p in sorted(muster):
         if not p.is_file():
             continue
         if SICHERUNGS_ORDNER in p.parts or ARBEITS_UNTERORDNER in p.parts:
+            continue
+        if any(_liegt_unter(p, a) for a in tabu):
             continue
         endung = p.suffix.lower()
         if endung == ZIEL_ENDUNG:
@@ -528,6 +555,17 @@ def sammle_dateien(ordner: Path, rekursiv: bool) -> tuple:
         else:
             unbekannt.append(p)
     return kandidaten, schon_mp4, mkvs, unbekannt
+
+
+def _freier_name(ziel: Path) -> Path:
+    """Hängt " (2)", " (3)" ... an, bis der Zielname frei ist."""
+    if not ziel.exists():
+        return ziel
+    for i in range(2, 1000):
+        kandidat = ziel.with_name(f"{ziel.stem} ({i}){ziel.suffix}")
+        if not kandidat.exists():
+            return kandidat
+    return ziel.with_name(f"{ziel.stem} (dup){ziel.suffix}")
 
 
 def sichere_original(quelle: Path, basis_ordner: Path, behalten: bool,
@@ -546,8 +584,11 @@ def sichere_original(quelle: Path, basis_ordner: Path, behalten: bool,
             log_func("SIM", t("konv.sim_original_move", ziel=str(ziel)))
             return
         if ziel.exists():
+            # Sicherungsziel belegt -> eindeutigen Namen suchen, statt die
+            # Datei liegen zu lassen. Bei lokaler Verarbeitung läge sie sonst
+            # verwaist im Arbeitsordner und würde beim nächsten Lauf gelöscht.
             log_func("WARN", t("konv.original_exists", name=quelle.name))
-            return
+            ziel = _freier_name(ziel)
         try:
             ziel_ordner.mkdir(parents=True, exist_ok=True)
             shutil.move(str(liegt_bei), str(ziel))
@@ -606,7 +647,9 @@ def verarbeite_videoordner(ffmpeg: str, ffprobe: str, ordner: str,
         # ── Phase 1: Scannen ────────────────────────────────────────────────
         task_q.put({"film": wurzel.name, "schritt": t("konv.step_scan"),
                     "sub_prog": None})
-        kandidaten, schon_mp4, mkvs, unbekannt = sammle_dateien(wurzel, rekursiv)
+        kandidaten, schon_mp4, mkvs, unbekannt = sammle_dateien(
+            wurzel, rekursiv,
+            ausgeschlossen=(sicherungs_pfad, arbeits_pfad))
         stats["gefunden"] = len(kandidaten)
 
         for p in schon_mp4:
@@ -623,7 +666,8 @@ def verarbeite_videoordner(ffmpeg: str, ffprobe: str, ordner: str,
             log("WARN", t("konv.nichts_zu_tun"))
             task_q.put({"schritt": t("konv.step_done"), "sub_prog": 100})
             fort_q.put(100)
-            done_q.put((stats, schreibe_konverter_log(log_zeilen, simulation)))
+            # Kein done_q.put hier – das finally am Ende der Funktion sendet
+            # das Signal und schreibt die Log-Datei (sonst beides doppelt).
             return
 
         # Auflösungen ermitteln und als Übersicht ausgeben
@@ -654,7 +698,6 @@ def verarbeite_videoordner(ffmpeg: str, ffprobe: str, ordner: str,
 
         if stopp_event.is_set():
             log("WARN", t("konv.abgebrochen"))
-            done_q.put((stats, schreibe_konverter_log(log_zeilen, simulation)))
             return
 
         # ── Encoder bestimmen ───────────────────────────────────────────────
@@ -766,7 +809,7 @@ def verarbeite_videoordner(ffmpeg: str, ffprobe: str, ordner: str,
                 ffmpeg_p, arbeits_quelle, arbeits_ziel, info, enc, qualitaet,
                 sar_korrigieren, log_q, task_q, log_zeilen, stopp_event,
                 mit_subs=True, sw_fallback_erlaubt=True,
-                ffmpeg_sw_encoder=sw_map.get(codec))
+                sw_encoder=sw_map.get(codec))
 
             if not (erfolg and arbeits_ziel.exists() and arbeits_ziel.stat().st_size > 0):
                 arbeits_ziel.unlink(missing_ok=True)

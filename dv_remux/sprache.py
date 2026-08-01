@@ -40,7 +40,7 @@ def setze_sprache(code: str) -> None:
 def t(key: str, **kwargs) -> str:
     """
     Übersetzten String für key in der aktuellen Sprache liefern.
-    Fallback-Kette: aktuelle Sprache -> Deutsch -> der Key selbst.
+    Fallback-Kette: aktuelle Sprache -> SPRACHE_DEFAULT (Englisch) -> der Key selbst.
     Fehlen Format-Platzhalter, wird der unformatierte Text zurückgegeben
     statt zu crashen.
     """
@@ -59,7 +59,9 @@ def _bereinige_log(text: str) -> str:
                 .replace("⚠️","WARNUNG").replace("⚠","WARNUNG")
                 .replace("📁","").replace("📺","")
                 .replace("▶",">>").replace("📝","SRT:")
-                .replace("🗑️","LOESCHEN:").replace("ℹ️","INFO:")
+                # Erst die Variante MIT Variation Selector (U+FE0F), dann das
+                # nackte U+2139 – sonst bliebe "ℹ" ohne VS16 in der Log-Datei.
+                .replace("🗑️","LOESCHEN:").replace("ℹ️","INFO:").replace("ℹ","INFO:")
                 .replace("🔍","ANALYSE:").replace("📋","")
                 .replace("🔵","DV:").replace("📂","")
                 .replace("📥","EMBED:").replace("📦","MOVE:")

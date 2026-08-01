@@ -14,7 +14,10 @@ def lese_hdrtype_aus_nfo(nfo_pfad: Path):
         if el is not None and el.text:
             # Leerzeichen entfernen: "Dolby Vision" → "dolbyvision"
             return el.text.strip().lower().replace(" ", "")
-    except ET.ParseError:
+    except Exception:
+        # Absichtlich breit: FileNotFoundError (NFO zwischen Scan und Lesen
+        # verschwunden), PermissionError und LookupError (unbekanntes encoding=
+        # in der XML-Deklaration) dürfen den Lauf nicht abbrechen.
         pass
     return None
 
@@ -157,9 +160,10 @@ def ermittle_hdrtype_aus_mkv(ffprobe: Path, mkv_pfad: Path):
     Gibt 'dolbyvision' zurück wenn Dolby Vision erkannt, sonst None.
 
     Erkennungs-Strategie (in Reihenfolge):
-      1. side_data_list im Stream: DOVI- oder DOLBY-Eintrag
-      2. side_data enthält dv_profile-Schlüssel (ältere ffprobe)
-      3. Fallback: Frame-Level-Analyse des ersten Frames (-read_intervals)
+      Prüfung 1: side_data_list im Stream – DOVI/DOLBY-Eintrag oder
+                 dv_profile-Schlüssel (ältere ffprobe liefern ihn direkt)
+      Prüfung 2: Fallback über die Frame-Level-Analyse des ersten Frames
+                 (-read_intervals, kein vollständiger Dekode)
     """
     befehl = [
         str(ffprobe), "-v", "quiet", "-print_format", "json",
@@ -224,7 +228,7 @@ def ermittle_dv_profil(ffprobe: Path, mkv_pfad: Path) -> tuple:
         "-show_streams", "-select_streams", "v:0", str(mkv_pfad)
     ]
 
-    def _parse_dovi_entry(entry: dict) -> int | None:
+    def _parse_dovi_entry(entry: dict) -> "int | None":
         """Gibt dv_profil aus einem DOVI-side_data-Eintrag zurück oder None."""
         if "dv_profile" in entry:
             try:

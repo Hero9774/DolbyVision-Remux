@@ -97,7 +97,12 @@ class App(tk.Tk):
         self.letzter_log_pfad  = None
         self.cfg               = config_laden()
 
-        self.var_sprache = tk.StringVar(value=self.cfg.get("sprache") or SPRACHE_DEFAULT)
+        # Unbekannte Sprachcodes gleich hier abfangen – setze_sprache() ignoriert
+        # sie sonst still und der Code landet unverändert wieder in der Config.
+        _sprach_code = self.cfg.get("sprache") or SPRACHE_DEFAULT
+        if _sprach_code not in SPRACHEN:
+            _sprach_code = SPRACHE_DEFAULT
+        self.var_sprache = tk.StringVar(value=_sprach_code)
         setze_sprache(self.var_sprache.get())
 
         self.var_ffbin    = tk.StringVar(value=self.cfg.get("ffbin",    self._auto_ffbin()))
@@ -132,7 +137,8 @@ class App(tk.Tk):
     # ─── Sprache ──────────────────────────────────────────────────────────────
     def _baue_sprach_dropdown(self, parent):
         anzeige_zu_code = {name: code for code, name in SPRACHEN.items()}
-        var_anzeige = tk.StringVar(value=SPRACHEN.get(self.var_sprache.get(), "Deutsch"))
+        var_anzeige = tk.StringVar(
+            value=SPRACHEN.get(self.var_sprache.get(), SPRACHEN[SPRACHE_DEFAULT]))
 
         def _on_wahl(_event=None):
             code = anzeige_zu_code.get(var_anzeige.get())
@@ -165,6 +171,8 @@ class App(tk.Tk):
         self.task_schritt_lbl.configure(text=t("gui.task_schritt"))
         self.task_status_lbl.configure(text=t("gui.task_status"))
         self.progress_lbl.configure(text=t("gui.progress_label"))
+        if not self.läuft:
+            self.task_status.configure(text=t("gui.status_ready"))
 
         for wert, btn in self._modus_btns.items():
             btn.configure(text=t(f"gui.mode_{wert}"))
@@ -357,10 +365,11 @@ class App(tk.Tk):
         self.dovi_status.pack(anchor="w")
 
         # ── Zeile 2: Quell-Ordner ─────────────────────────────────────────
-        self.root_entry_lbl = ttk.Label(panel, text=t("gui.root_folder"), style="Muted.TLabel")
+        # Ein einziges Label: der Text wird von _modus_update() gesetzt
+        # (gui.root_label.filme / .serien / .ordner). root_lbl ist nur ein Alias
+        # auf dasselbe Widget – es gibt hier bewusst kein zweites Label.
+        self.root_entry_lbl = ttk.Label(panel, text=t("gui.root_label.filme"), style="Muted.TLabel")
         self.root_entry_lbl.grid(row=2, column=0, padx=(12,8), pady=(9,0), sticky="w")
-        # self.root_lbl bleibt der Modus-abhängige Hinweistext (siehe _modus_update);
-        # self.root_entry_lbl ist das feste Feld-Label links davon.
         self.root_lbl = self.root_entry_lbl
         ttk.Entry(panel, textvariable=self.var_root).grid(
             row=2, column=1, padx=(0,6), pady=(9,0), sticky="ew", ipady=4)
@@ -648,6 +657,49 @@ class App(tk.Tk):
             self.stopp_event.set()
             if konv_laeuft:
                 konv.stopp_event.set()
+            # NICHT sofort zerstören: die Worker-Threads sind daemon=True und
+            # würden hart abgebrochen. Dann liefe weder das Rollback noch der
+            # finally-Block, der die Original-MKV aus dem lokalen Arbeitsordner
+            # zurückschiebt -> Datenverlust.
+            self._konv_config_sichern()
+            self.status_lbl.configure(text=t("gui.status_stopping"), fg=self.YELLOW)
+            self._warte_auf_ende()
+            return
+        self._konv_config_sichern()
+        config_speichern(self._config_dict())
+        self.destroy()
+
+    def _konv_config_sichern(self):
+        """
+        Einstellungen des Konverter-Fensters übernehmen, bevor gespeichert wird.
+        Wird das Hauptfenster geschlossen, stirbt das Toplevel als Kind, ohne
+        dass sein eigener WM_DELETE_WINDOW-Handler feuert – die konv_*-Keys
+        gingen sonst verloren.
+        """
+        konv = self.konverter_fenster
+        try:
+            if konv is not None and konv.winfo_exists():
+                konv._config_uebernehmen()
+        except Exception:
+            pass
+
+    def _warte_auf_ende(self, versuche: int = 0):
+        """
+        Pollt, bis beide Worker beendet sind, und schließt erst dann das Fenster.
+        Nach spätestens ~60 s wird trotzdem geschlossen, damit ein hängender
+        ffmpeg-Aufruf das Beenden nicht dauerhaft blockiert.
+        """
+        konv = self.konverter_fenster
+        konv_laeuft = False
+        try:
+            konv_laeuft = bool(konv is not None and konv.winfo_exists() and konv.laeuft)
+        except Exception:
+            konv_laeuft = False
+
+        if (self.läuft or konv_laeuft) and versuche < 300:
+            self.after(200, lambda: self._warte_auf_ende(versuche + 1))
+            return
+
         config_speichern(self._config_dict())
         self.destroy()
 
@@ -823,12 +875,16 @@ class App(tk.Tk):
 
     def _log_oeffnen(self):
         if self.letzter_log_pfad and self.letzter_log_pfad.exists():
-            if sys.platform == "win32":
-                os.startfile(self.letzter_log_pfad)
-            elif sys.platform == "darwin":
-                subprocess.run(["open", str(self.letzter_log_pfad)])
-            else:
-                subprocess.run(["xdg-open", str(self.letzter_log_pfad)])
+            try:
+                if sys.platform == "win32":
+                    os.startfile(self.letzter_log_pfad)
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", str(self.letzter_log_pfad)])
+                else:
+                    subprocess.run(["xdg-open", str(self.letzter_log_pfad)])
+            except Exception as e:
+                messagebox.showerror(t("gui.log_dialog_title"),
+                                     t("gui.log_open_failed", fehler=e))
         else:
             messagebox.showinfo(t("gui.log_dialog_title"), t("gui.log_not_yet_available"))
 
@@ -836,25 +892,24 @@ class App(tk.Tk):
     def _starten(self, simulation: bool):
         if self.läuft:
             return
-        ist_sim = simulation
         fehler  = []
 
-        # ffmpeg-Ordner und abgeleitete Pfade prüfen
-        if not ist_sim:
-            ffmpeg_pfad  = self._ffmpeg_pfad()
-            ffprobe_pfad = self._ffprobe_pfad()
-            if not self.var_ffbin.get() or not Path(self.var_ffbin.get()).is_dir():
-                fehler.append(t("gui.err_ffmpeg_folder_invalid"))
-            else:
-                if not Path(ffmpeg_pfad).is_file():
-                    fehler.append(
-                        t("gui.err_ffmpeg_not_found", name=Path(ffmpeg_pfad).name))
-                if not Path(ffprobe_pfad).is_file():
-                    fehler.append(
-                        t("gui.err_ffprobe_not_found", name=Path(ffprobe_pfad).name))
+        ffmpeg_pfad  = self._ffmpeg_pfad()
+        ffprobe_pfad = self._ffprobe_pfad()
+
+        # ffmpeg-Ordner und abgeleitete Pfade prüfen.
+        # ffprobe wird AUCH in der Simulation gebraucht: die HDR-Erkennung
+        # (ermittle_hdrtype_aus_mkv) läuft dort ebenfalls. Fehlt ffprobe, würde
+        # sonst jeder Film stumm als "kein Dolby Vision" übersprungen.
+        if not self.var_ffbin.get() or not Path(self.var_ffbin.get()).is_dir():
+            fehler.append(t("gui.err_ffmpeg_folder_invalid"))
         else:
-            ffmpeg_pfad  = self._ffmpeg_pfad()
-            ffprobe_pfad = self._ffprobe_pfad()
+            if not simulation and not Path(ffmpeg_pfad).is_file():
+                fehler.append(
+                    t("gui.err_ffmpeg_not_found", name=Path(ffmpeg_pfad).name))
+            if not Path(ffprobe_pfad).is_file():
+                fehler.append(
+                    t("gui.err_ffprobe_not_found", name=Path(ffprobe_pfad).name))
 
         if not self.var_root.get() or not Path(self.var_root.get()).is_dir():
             fehler.append(t("gui.err_root_invalid"))
@@ -864,12 +919,24 @@ class App(tk.Tk):
             p = self.var_lokale_kopie_pfad.get().strip()
             if not p:
                 fehler.append(t("gui.err_workdir_not_set"))
+            elif simulation:
+                # In der Simulation darf nichts auf die Platte geschrieben werden.
+                lokale_kopie_pfad_obj = Path(p)
             else:
                 try:
                     Path(p).mkdir(parents=True, exist_ok=True)
                     lokale_kopie_pfad_obj = Path(p)
                 except OSError as e:
                     fehler.append(t("gui.err_workdir_unreachable", fehler=e))
+                # Arbeitsordner darf nicht der Quellordner sein – sonst würde die
+                # MKV beim "Verschieben" auf sich selbst kopiert.
+                wurzel = self.var_root.get().strip()
+                if lokale_kopie_pfad_obj and wurzel:
+                    try:
+                        if lokale_kopie_pfad_obj.resolve() == Path(wurzel).resolve():
+                            fehler.append(t("gui.err_workdir_is_root"))
+                    except OSError:
+                        pass
 
         if fehler:
             for f in fehler:
@@ -893,7 +960,7 @@ class App(tk.Tk):
         self.task_status.configure(text=t("gui.task_status_running"), fg=self.YELLOW)
         self._log_leeren()
 
-        if ist_sim:
+        if simulation:
             self.sim_banner.configure(text=t("gui.sim_banner"))
             self.configure(bg="#110d0a")
             self._log("SIM", t("gui.sim_log_notice"))
@@ -918,7 +985,7 @@ class App(tk.Tk):
                 ffmpeg_pfad,
                 ffprobe_pfad,
                 self.var_root.get(),
-                ist_sim,
+                simulation,
                 self.var_behalten.get(),
                 self.var_subs.get(),
                 self.var_nfo.get(),

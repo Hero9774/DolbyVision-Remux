@@ -18,7 +18,9 @@ from pathlib import Path
 
 from dv_remux.config import config_speichern
 from dv_remux.konstanten import VERSION
-from dv_remux.konverter import QUALITAET_DEFAULT, verarbeite_videoordner
+from dv_remux.konverter import (
+    CODEC_WERTE, QUALITAET_DEFAULT, verarbeite_videoordner,
+)
 from dv_remux.sprache import t
 
 
@@ -52,8 +54,14 @@ class KonverterFenster(tk.Toplevel):
         self.var_behalten   = tk.BooleanVar(value=cfg.get("konv_behalten", False))
         self.var_amd        = tk.BooleanVar(value=cfg.get("konv_amd", True))
         self.var_sar        = tk.BooleanVar(value=cfg.get("konv_sar", True))
-        # HEVC/H.265 ist die bevorzugte Vorgabe (kleinere Dateien bei gleicher Qualität)
-        self.var_codec      = tk.StringVar(value=cfg.get("konv_codec", "hevc"))
+        # Zielcodec: H.264 oder H.265/HEVC – beide laufen über die AMD-AMF-
+        # Hardwarebeschleunigung (h264_amf / hevc_amf), sofern verfügbar.
+        # Vorgabe ist H.265: kleinere Dateien bei gleicher Qualität.
+        # Ältere Configs können noch "auto" enthalten -> auf hevc migrieren.
+        _codec = cfg.get("konv_codec", "hevc")
+        if _codec not in CODEC_WERTE:
+            _codec = "hevc"
+        self.var_codec      = tk.StringVar(value=_codec)
         self.var_qualitaet  = tk.StringVar(value=cfg.get("konv_qualitaet", QUALITAET_DEFAULT))
         self.var_lokal      = tk.BooleanVar(value=cfg.get("konv_lokal", True))
         if not self.var_lokal_pfad.get().strip():
@@ -126,7 +134,7 @@ class KonverterFenster(tk.Toplevel):
                                   font=("Consolas", 9))
         self.codec_lbl.pack(side="left", padx=(0, 10))
         self._codec_btns = {}
-        for wert in ("auto", "h264", "hevc"):
+        for wert in CODEC_WERTE:
             btn = ttk.Button(codec_frame, text=t(f"konvgui.codec_{wert}"),
                              command=lambda v=wert: self._set_codec(v))
             btn.pack(side="left", padx=(0, 4))
@@ -207,6 +215,9 @@ class KonverterFenster(tk.Toplevel):
             bf, text=f"{t('gui.on_prefix')}{t('gui.autoscroll')}",
             style="ToggleOn.TButton", command=self._toggle_autoscroll)
         self.btn_autoscroll.pack(side="left", padx=(8, 0))
+        self.btn_info = ttk.Button(bf, text=t("konvgui.btn_info"),
+                                   style="Log.TButton", command=self._info_dialog)
+        self.btn_info.pack(side="right")
 
         # Status + Fortschritt
         status_frame = ttk.Frame(self)
@@ -294,6 +305,7 @@ class KonverterFenster(tk.Toplevel):
         self.btn_stopp.configure(text=t("konvgui.btn_stop"))
         self.btn_log.configure(text=t("konvgui.btn_log"))
         self.btn_log_leeren.configure(text=t("konvgui.btn_log_clear"))
+        self.btn_info.configure(text=t("konvgui.btn_info"))
         self.task_datei_lbl.configure(text=t("konvgui.task_file"))
         self.task_schritt_lbl.configure(text=t("konvgui.task_step"))
         self.task_status_lbl.configure(text=t("gui.task_status"))
@@ -306,6 +318,7 @@ class KonverterFenster(tk.Toplevel):
         self.btn_autoscroll.configure(text=f"{prefix}{t('gui.autoscroll')}")
         if not self.laeuft:
             self.status_lbl.configure(text=t("konvgui.status_ready"))
+            self.task_status.configure(text=t("konvgui.status_ready"))
         self._toggle_styles_update()
 
     # ─── Toggles ─────────────────────────────────────────────────────────────
@@ -366,15 +379,66 @@ class KonverterFenster(tk.Toplevel):
 
     def _log_oeffnen(self):
         if self.letzter_log_pfad and Path(self.letzter_log_pfad).exists():
-            if sys.platform == "win32":
-                os.startfile(self.letzter_log_pfad)
-            elif sys.platform == "darwin":
-                subprocess.run(["open", str(self.letzter_log_pfad)])
-            else:
-                subprocess.run(["xdg-open", str(self.letzter_log_pfad)])
+            try:
+                if sys.platform == "win32":
+                    os.startfile(self.letzter_log_pfad)
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", str(self.letzter_log_pfad)])
+                else:
+                    subprocess.run(["xdg-open", str(self.letzter_log_pfad)])
+            except Exception as e:
+                messagebox.showerror(t("gui.log_dialog_title"),
+                                     t("gui.log_open_failed", fehler=e), parent=self)
         else:
             messagebox.showinfo(t("gui.log_dialog_title"),
                                 t("gui.log_not_yet_available"), parent=self)
+
+    # ─── Info-Dialog ─────────────────────────────────────────────────────────
+    def _info_dialog(self):
+        """Kurzbeschreibung, was der Konverter tut – scrollbar, sprachabhängig."""
+        dlg = tk.Toplevel(self)
+        dlg.title(t("konvgui.info_title"))
+        dlg.configure(bg=self.BG)
+        dlg.geometry("720x560")
+        dlg.minsize(560, 420)
+        dlg.transient(self)
+
+        kopf = tk.Frame(dlg, bg=self.BG)
+        kopf.pack(fill="x", padx=20, pady=(16, 4))
+        tk.Label(kopf, text=t("konvgui.info_title"), fg=self.ACCENT2, bg=self.BG,
+                 font=("Consolas", 14, "bold")).pack(side="left")
+        tk.Label(kopf, text=f"  v{VERSION}", fg=self.MUTED, bg=self.BG,
+                 font=("Consolas", 9)).pack(side="left", pady=4)
+        tk.Frame(dlg, bg=self.BORDER, height=1).pack(fill="x", padx=20, pady=(2, 10))
+
+        rahmen = tk.Frame(dlg, bg=self.BORDER)
+        rahmen.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        txt = scrolledtext.ScrolledText(
+            rahmen, bg="#090d13", fg=self.TEXT, font=("Consolas", 9),
+            wrap="word", borderwidth=0, relief="flat",
+            selectbackground=self.ACCENT)
+        txt.pack(fill="both", expand=True, padx=1, pady=1)
+        txt.tag_configure("H", foreground=self.ACCENT,
+                          font=("Consolas", 10, "bold"), spacing1=8, spacing3=4)
+
+        # Aufbau: "konvgui.info_1" ... bis der nächste Key fehlt.
+        # Zeilen, die mit "# " beginnen, werden als Überschrift formatiert.
+        nummer = 1
+        while True:
+            key = f"konvgui.info_{nummer}"
+            zeile = t(key)
+            if zeile == key:          # kein Text mehr hinterlegt
+                break
+            if zeile.startswith("# "):
+                txt.insert("end", zeile[2:] + "\n", "H")
+            else:
+                txt.insert("end", zeile + "\n")
+            nummer += 1
+        txt.configure(state="disabled")
+
+        ttk.Button(dlg, text=t("konvgui.info_close"), style="Log.TButton",
+                   command=dlg.destroy).pack(pady=(0, 16))
+        dlg.bind("<Escape>", lambda _: dlg.destroy())
 
     # ─── Config ──────────────────────────────────────────────────────────────
     def _config_uebernehmen(self):

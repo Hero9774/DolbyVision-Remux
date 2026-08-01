@@ -1,5 +1,6 @@
 """dvcC-Box-Injektion, faststart/mp42-Patch und DV-Nachbearbeitung auf MP4-Binärebene."""
 
+import os
 import queue
 import struct
 from pathlib import Path
@@ -98,6 +99,13 @@ def injiziere_dvcc_box(mp4_pfad: Path, dv_profil: int = 8,
             if moov_off is None:
                 return False
 
+            # Der Schreibvorgang unten setzt voraus, dass moov die LETZTE
+            # Top-Level-Box ist – sonst überschreibt f.write() den mdat-Anfang
+            # und f.truncate() wirft den Rest der Datei weg. Bei einer bereits
+            # gefaststarteten MP4 (moov vorne) wäre das Video danach zerstört.
+            if moov_off + moov_sz != datei_sz:
+                return False
+
             f.seek(moov_off)
             moov = bytearray(f.read(moov_sz))
 
@@ -163,7 +171,14 @@ def injiziere_dvcc_box(mp4_pfad: Path, dv_profil: int = 8,
 
         for soff in [0] + groessen_offs:
             alt = struct.unpack_from(">I", moov, soff)[0]
-            struct.pack_into(">I", moov, soff, alt + len(dv_box))
+            if alt == 1:
+                # 64-Bit-Box: die echte Größe steht als largesize hinter dem Typ.
+                # Blind 32 Bit zu schreiben würde den Marker überschreiben und
+                # den kompletten Box-Baum ab dieser Stelle zerstören.
+                gross = struct.unpack_from(">Q", moov, soff + 8)[0]
+                struct.pack_into(">Q", moov, soff + 8, gross + len(dv_box))
+            else:
+                struct.pack_into(">I", moov, soff, alt + len(dv_box))
 
         with open(mp4_pfad, "r+b") as f:
             f.seek(moov_off)
@@ -301,11 +316,16 @@ def mache_faststart_und_ftyp(mp4_pfad: Path) -> bool:
                     fout.write(chunk)
                     verbleibend -= len(chunk)
 
-            mp4_pfad.unlink()
-            tmp_pfad.rename(mp4_pfad)
+            # os.replace() ersetzt atomar – kein Zeitfenster, in dem die Datei
+            # NUR als Temp-Kopie existiert. Ein unlink()+rename() würde bei
+            # einem fehlgeschlagenen rename (Windows: Virenscanner/Explorer
+            # halten die frische Datei offen -> WinError 32) die einzige
+            # verbliebene Kopie im except-Zweig mitlöschen.
+            os.replace(str(tmp_pfad), str(mp4_pfad))
             return True
         except Exception:
-            if tmp_pfad.exists():
+            # Nur aufräumen, wenn das Original nachweislich noch existiert.
+            if tmp_pfad.exists() and mp4_pfad.exists():
                 tmp_pfad.unlink(missing_ok=True)
             raise
 
@@ -352,8 +372,10 @@ def _dvcc_vorhanden(mp4_pfad: Path) -> bool:
 def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,
                           log_zeilen: list, simulation: bool) -> None:
     """
-    Nach normalem DV-Remux (ohne faststart): dvcC prüfen/injizieren,
-    dann moov nach vorne schieben (faststart) und ftyp auf mp42 setzen.
+    Nach normalem DV-Remux (ohne faststart): DV-Konfigurationsbox (dvvC/dvcC)
+    prüfen/injizieren, dann moov nach vorne schieben (faststart) und ftyp auf
+    mp42 setzen. Reihenfolge ist zwingend: die Injektion verlangt moov am
+    Dateiende, faststart schiebt es nach vorne.
     """
     if simulation:
         return
@@ -387,7 +409,11 @@ def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,
 
 def _dvcc_schritt(mp4_pfad: Path, hat_dvcc: bool, log_q: queue.Queue,
                   log_zeilen: list) -> None:
-    """HEVC-dvcC-Box prüfen/injizieren (aus nachbearbeite_dv_mp4 ausgelagert)."""
+    """
+    HEVC-DV-Konfigurationsbox prüfen/injizieren (aus nachbearbeite_dv_mp4
+    ausgelagert). Geschrieben wird je nach Sample-Entry dvvC oder dvcC –
+    siehe _dv_box_typ().
+    """
     if not hat_dvcc:
         text = t("postproc.dvcc_missing")
         log_q.put(("INFO", text))

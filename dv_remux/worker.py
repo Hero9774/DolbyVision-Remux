@@ -22,6 +22,61 @@ from dv_remux.pipeline import (
 )
 
 
+def _zusammenfassung(log, stats: dict, simulation: bool, suffix: str) -> None:
+    """Den Abschluss-Block ins Log schreiben (für alle drei Worker identisch)."""
+    log("HEAD", f"\n{'='*55}")
+    log("HEAD",   t("worker.summary_title", suffix=suffix))
+    log("HEAD", f"{'='*55}")
+    log("OK",   t("worker.summary_found", anzahl=stats['gefunden']))
+    log("OK",   t("worker.summary_remuxed", anzahl=stats['remuxed']))
+    log("SKIP", t("worker.summary_skipped", anzahl=stats['uebersprungen']))
+    log("ERR",  t("worker.summary_errors", anzahl=stats['fehler']))
+    log("HEAD", f"{'='*55}")
+    if simulation:
+        log("SIM", t("worker.summary_sim_note"))
+
+
+def _worker_rahmen(impl, suffix: str, simulation: bool,
+                   log_q: queue.Queue, task_q: queue.Queue,
+                   fort_q: queue.Queue, done_q: queue.Queue, **kwargs):
+    """
+    Gemeinsamer Rahmen um die drei Worker-Implementierungen.
+
+    Garantiert, dass IMMER genau ein done_q-Signal gesendet wird – auch wenn im
+    Worker eine unerwartete Exception fliegt (NAS-Freigabe weg, PermissionError
+    beim iterdir(), stat() auf eine gerade gelöschte Datei ...). Ohne diesen
+    Rahmen stirbt der Thread stumm, die GUI wartet ewig auf das Signal und
+    Start/Simulation bleiben dauerhaft deaktiviert.
+
+    Zusatznutzen: Zusammenfassung und Log-Datei entstehen erst NACH dem
+    finally-Block der Implementierung – die Restore-Meldungen ("Original nach
+    Fehler zurückverschoben") landen dadurch auch in der Log-Datei und nicht
+    nur in der GUI.
+    """
+    log_zeilen = []
+    stats = {"gefunden": 0, "remuxed": 0, "uebersprungen": 0, "fehler": 0}
+
+    def log(typ: str, text: str):
+        log_q.put((typ, text))
+        log_zeilen.append(_bereinige_log(text))
+
+    try:
+        impl(log=log, log_zeilen=log_zeilen, stats=stats,
+             simulation=simulation, log_q=log_q, task_q=task_q,
+             fort_q=fort_q, **kwargs)
+    except Exception as e:
+        log("ERR", t("worker.worker_error", fehler=e))
+        stats["fehler"] += 1
+    finally:
+        fort_q.put(100)
+        task_q.put({"film": t("worker.done"), "schritt": "", "sub_prog": 100})
+        _zusammenfassung(log, stats, simulation, suffix)
+        log_pfad = schreibe_log_datei(log_zeilen, simulation)
+        log("HEAD", t("worker.summary_log_saved", name=log_pfad.name))
+        log("HEAD", t("worker.summary_log_location", pfad=log_pfad.parent))
+        done_q.put((stats, log_pfad))
+
+
 def verarbeite_serien(
         ffmpeg_pfad: str, ffprobe_pfad: str, root_pfad: str,
         simulation: bool, original_behalten: bool,
@@ -32,15 +87,30 @@ def verarbeite_serien(
         lokale_kopie: bool = False, lokale_kopie_pfad: Path = None,
         dts_zu_eac3: bool = False):
     """Serien-Worker: root → Show-Ordner → Staffel-Ordner → episode.mkv"""
+    _worker_rahmen(
+        _verarbeite_serien_impl, "  [SERIEN]", simulation,
+        log_q, task_q, fort_q, done_q,
+        ffmpeg_pfad=ffmpeg_pfad, ffprobe_pfad=ffprobe_pfad, root_pfad=root_pfad,
+        original_behalten=original_behalten, untertitel=untertitel,
+        nfo_update=nfo_update, embed_subs=embed_subs, stopp_event=stopp_event,
+        old_mkv_global_pfad=old_mkv_global_pfad, lokale_kopie=lokale_kopie,
+        lokale_kopie_pfad=lokale_kopie_pfad, dts_zu_eac3=dts_zu_eac3)
+
+
+def _verarbeite_serien_impl(
+        ffmpeg_pfad: str, ffprobe_pfad: str, root_pfad: str,
+        simulation: bool, original_behalten: bool,
+        untertitel: bool, nfo_update: bool, embed_subs: bool,
+        log_q: queue.Queue, task_q: queue.Queue, fort_q: queue.Queue,
+        log, log_zeilen: list, stats: dict,
+        stopp_event=None, old_mkv_global_pfad: Path = None,
+        lokale_kopie: bool = False, lokale_kopie_pfad: Path = None,
+        dts_zu_eac3: bool = False):
+    """Implementierung des Serien-Workers – Rahmen siehe _worker_rahmen()."""
 
     ffmpeg     = Path(ffmpeg_pfad)
     ffprobe    = Path(ffprobe_pfad)
     root       = Path(root_pfad)
-    log_zeilen = []
-
-    def log(typ: str, text: str):
-        log_q.put((typ, text))
-        log_zeilen.append(_bereinige_log(text))
 
     modus_text = t("logheader.sim") if simulation else t("logheader.run")
     log("HEAD", f"{'='*55}")
@@ -54,14 +124,14 @@ def verarbeite_serien(
     def ist_kein_trickplay(p: Path) -> bool:
         return p.is_dir() and "trickplay" not in p.name.lower()
 
-    # Wenn root selbst MKV-Dateien enthält → Einzelserie direkt im Root-Ordner
+    # Wenn root selbst MKV-Dateien enthält → Einzelserie direkt im Root-Ordner.
+    # Etwaige Unterordner werden dann als Staffeln behandelt (siehe unten).
     if any(root.glob("*.mkv")):
         show_liste = [root]
     else:
         show_liste = sorted([p for p in root.iterdir() if ist_kein_trickplay(p)])
 
     gesamt   = len(show_liste)
-    stats    = {"gefunden": 0, "remuxed": 0, "uebersprungen": 0, "fehler": 0}
     undo_log = []
 
     for i, show_ordner in enumerate(show_liste):
@@ -72,7 +142,11 @@ def verarbeite_serien(
         fort_q.put(int(i / gesamt * 100) if gesamt else 0)
         log("FOLDER", t("worker.serien.show_folder", name=show_ordner.name))
 
+        # Der Show-Ordner selbst zählt als "Staffel", sobald er MKVs enthält –
+        # sonst würden lose Episoden neben einem Season-Ordner nie verarbeitet.
         staffeln = sorted([p for p in show_ordner.iterdir() if ist_kein_trickplay(p)])
+        if any(show_ordner.glob("*.mkv")):
+            staffeln = [show_ordner] + staffeln
         if not staffeln:
             staffeln = [show_ordner]
 
@@ -193,7 +267,7 @@ def verarbeite_serien(
                                 ffmpeg, DOVI_TOOL, ffprobe,
                                 arbeits_mkv, arbeits_mp4,
                                 log_q, task_q, simulation, log_zeilen,
-                                stopp_event=stopp_event)
+                                stopp_event=stopp_event, dts_zu_eac3=dts_zu_eac3)
                         else:
                             remux_ok = remux_zu_mp4(
                                 ffmpeg, arbeits_mkv, arbeits_mp4,
@@ -235,7 +309,8 @@ def verarbeite_serien(
                             erstellte_srts = extrahiere_untertitel(
                                 ffmpeg, arbeits_mkv, srt_streams, log_q, task_q, simulation, log_zeilen,
                                 undo_log=undo_log if not simulation else None,
-                                ziel_ordner=mkv_pfad.parent)
+                                ziel_ordner=mkv_pfad.parent,
+                                stopp_event=stopp_event)
                         elif untertitel:
                             log("INFO", "  " + t("worker.no_foreign_subs"))
                             task_q.put({"schritt": t("worker.step_no_subs"), "sub_prog": 100})
@@ -249,7 +324,9 @@ def verarbeite_serien(
                             mkv_pfad, original_behalten, simulation, log,
                             undo_log=undo_log,
                             old_mkv_global_pfad=old_mkv_global_pfad,
-                            aktueller_pfad=arbeits_mkv if lokal_aktiv else None)
+                            aktueller_pfad=arbeits_mkv if lokal_aktiv else None,
+                            log_q=log_q, task_q=task_q, log_zeilen=log_zeilen,
+                            stopp_event=stopp_event)
                         if lokal_aktiv and not simulation:
                             mkv_verschoben = arbeits_mkv.exists()
 
@@ -281,25 +358,6 @@ def verarbeite_serien(
     if stopp_event and stopp_event.is_set() and not simulation:
         rollback_session(undo_log, log, task_q)
 
-    fort_q.put(100)
-    task_q.put({"film": t("worker.done"), "schritt": "", "sub_prog": 100})
-
-    log("HEAD", f"\n{'='*55}")
-    log("HEAD",   t("worker.summary_title", suffix="  [SERIEN]"))
-    log("HEAD", f"{'='*55}")
-    log("OK",   t("worker.summary_found", anzahl=stats['gefunden']))
-    log("OK",   t("worker.summary_remuxed", anzahl=stats['remuxed']))
-    log("SKIP", t("worker.summary_skipped", anzahl=stats['uebersprungen']))
-    log("ERR",  t("worker.summary_errors", anzahl=stats['fehler']))
-    log("HEAD", f"{'='*55}")
-    if simulation:
-        log("SIM", t("worker.summary_sim_note"))
-
-    log_pfad = schreibe_log_datei(log_zeilen, simulation)
-    log("HEAD", t("worker.summary_log_saved", name=log_pfad.name))
-    log("HEAD", t("worker.summary_log_location", pfad=log_pfad.parent))
-    done_q.put((stats, log_pfad))
-
 
 def verarbeite_sammlung(
         ffmpeg_pfad: str, ffprobe_pfad: str, root_pfad: str,
@@ -311,15 +369,30 @@ def verarbeite_sammlung(
         lokale_kopie: bool = False, lokale_kopie_pfad: Path = None,
         dts_zu_eac3: bool = False):
     """Haupt-Worker (eigener Thread)."""
+    _worker_rahmen(
+        _verarbeite_sammlung_impl, "", simulation,
+        log_q, task_q, fort_q, done_q,
+        ffmpeg_pfad=ffmpeg_pfad, ffprobe_pfad=ffprobe_pfad, root_pfad=root_pfad,
+        original_behalten=original_behalten, untertitel=untertitel,
+        nfo_update=nfo_update, embed_subs=embed_subs, stopp_event=stopp_event,
+        old_mkv_global_pfad=old_mkv_global_pfad, lokale_kopie=lokale_kopie,
+        lokale_kopie_pfad=lokale_kopie_pfad, dts_zu_eac3=dts_zu_eac3)
+
+
+def _verarbeite_sammlung_impl(
+        ffmpeg_pfad: str, ffprobe_pfad: str, root_pfad: str,
+        simulation: bool, original_behalten: bool,
+        untertitel: bool, nfo_update: bool, embed_subs: bool,
+        log_q: queue.Queue, task_q: queue.Queue, fort_q: queue.Queue,
+        log, log_zeilen: list, stats: dict,
+        stopp_event=None, old_mkv_global_pfad: Path = None,
+        lokale_kopie: bool = False, lokale_kopie_pfad: Path = None,
+        dts_zu_eac3: bool = False):
+    """Implementierung des Filme-Workers – Rahmen siehe _worker_rahmen()."""
 
     ffmpeg  = Path(ffmpeg_pfad)
     ffprobe = Path(ffprobe_pfad)
     root    = Path(root_pfad)
-    log_zeilen = []
-
-    def log(typ: str, text: str):
-        log_q.put((typ, text))
-        log_zeilen.append(_bereinige_log(text))
 
     modus_text = t("logheader.sim") if simulation else t("logheader.run")
     log("HEAD", f"{'='*55}")
@@ -330,7 +403,6 @@ def verarbeite_sammlung(
 
     ordner_liste = sorted([p for p in root.iterdir() if p.is_dir()])
     gesamt   = len(ordner_liste)
-    stats    = {"gefunden": 0, "remuxed": 0, "uebersprungen": 0, "fehler": 0}
     undo_log = []
 
     for i, ordner in enumerate(ordner_liste):
@@ -452,7 +524,7 @@ def verarbeite_sammlung(
                         ffmpeg, DOVI_TOOL, ffprobe,
                         arbeits_mkv, arbeits_mp4,
                         log_q, task_q, simulation, log_zeilen,
-                        stopp_event=stopp_event)
+                        stopp_event=stopp_event, dts_zu_eac3=dts_zu_eac3)
                 else:
                     remux_ok = remux_zu_mp4(
                         ffmpeg, arbeits_mkv, arbeits_mp4,
@@ -495,7 +567,7 @@ def verarbeite_sammlung(
                     erstellte_srts = extrahiere_untertitel(
                         ffmpeg, arbeits_mkv, srt_streams, log_q, task_q, simulation, log_zeilen,
                         undo_log=undo_log if not simulation else None,
-                        ziel_ordner=ordner)
+                        ziel_ordner=ordner, stopp_event=stopp_event)
                 elif untertitel:
                     log("INFO", t("worker.no_foreign_subs"))
                     task_q.put({"schritt": t("worker.step_no_subs"), "sub_prog": 100})
@@ -509,7 +581,9 @@ def verarbeite_sammlung(
                     mkv_pfad, original_behalten, simulation, log,
                     undo_log=undo_log,
                     old_mkv_global_pfad=old_mkv_global_pfad,
-                    aktueller_pfad=arbeits_mkv if lokal_aktiv else None)
+                    aktueller_pfad=arbeits_mkv if lokal_aktiv else None,
+                    log_q=log_q, task_q=task_q, log_zeilen=log_zeilen,
+                    stopp_event=stopp_event)
                 if lokal_aktiv and not simulation:
                     mkv_verschoben = arbeits_mkv.exists()
 
@@ -546,28 +620,6 @@ def verarbeite_sammlung(
     if stopp_event and stopp_event.is_set() and not simulation:
         rollback_session(undo_log, log, task_q)
 
-    fort_q.put(100)
-    task_q.put({"film": t("worker.done"), "schritt": "", "sub_prog": 100})
-
-    # 9. Zusammenfassung
-    log("HEAD", f"\n{'='*55}")
-    log("HEAD",   t("worker.summary_title", suffix=""))
-    log("HEAD", f"{'='*55}")
-    log("OK",   t("worker.summary_found", anzahl=stats['gefunden']))
-    log("OK",   t("worker.summary_remuxed", anzahl=stats['remuxed']))
-    log("SKIP", t("worker.summary_skipped", anzahl=stats['uebersprungen']))
-    log("ERR",  t("worker.summary_errors", anzahl=stats['fehler']))
-    log("HEAD", f"{'='*55}")
-    if simulation:
-        log("SIM", t("worker.summary_sim_note"))
-
-    # 10. Log-Datei schreiben
-    log_pfad = schreibe_log_datei(log_zeilen, simulation)
-    log("HEAD", t("worker.summary_log_saved", name=log_pfad.name))
-    log("HEAD", t("worker.summary_log_location", pfad=log_pfad.parent))
-
-    done_q.put((stats, log_pfad))
-
 
 def verarbeite_einzelordner(
         ffmpeg_pfad: str, ffprobe_pfad: str, ordner_pfad: str,
@@ -579,15 +631,30 @@ def verarbeite_einzelordner(
         lokale_kopie: bool = False, lokale_kopie_pfad: Path = None,
         dts_zu_eac3: bool = False):
     """Einzelordner-Worker: verarbeitet genau einen Film-Ordner (direkt MKV darin)."""
+    _worker_rahmen(
+        _verarbeite_einzelordner_impl, "  [EINZELORDNER]", simulation,
+        log_q, task_q, fort_q, done_q,
+        ffmpeg_pfad=ffmpeg_pfad, ffprobe_pfad=ffprobe_pfad, ordner_pfad=ordner_pfad,
+        original_behalten=original_behalten, untertitel=untertitel,
+        nfo_update=nfo_update, embed_subs=embed_subs, stopp_event=stopp_event,
+        old_mkv_global_pfad=old_mkv_global_pfad, lokale_kopie=lokale_kopie,
+        lokale_kopie_pfad=lokale_kopie_pfad, dts_zu_eac3=dts_zu_eac3)
+
+
+def _verarbeite_einzelordner_impl(
+        ffmpeg_pfad: str, ffprobe_pfad: str, ordner_pfad: str,
+        simulation: bool, original_behalten: bool,
+        untertitel: bool, nfo_update: bool, embed_subs: bool,
+        log_q: queue.Queue, task_q: queue.Queue, fort_q: queue.Queue,
+        log, log_zeilen: list, stats: dict,
+        stopp_event=None, old_mkv_global_pfad: Path = None,
+        lokale_kopie: bool = False, lokale_kopie_pfad: Path = None,
+        dts_zu_eac3: bool = False):
+    """Implementierung des Einzelordner-Workers – Rahmen siehe _worker_rahmen()."""
 
     ffmpeg  = Path(ffmpeg_pfad)
     ffprobe = Path(ffprobe_pfad)
     ordner  = Path(ordner_pfad)
-    log_zeilen = []
-
-    def log(typ: str, text: str):
-        log_q.put((typ, text))
-        log_zeilen.append(_bereinige_log(text))
 
     modus_text = t("logheader.sim") if simulation else t("logheader.run")
     log("HEAD", f"{'='*55}")
@@ -596,7 +663,6 @@ def verarbeite_einzelordner(
     log("HEAD", t("worker.einzel.header_folder", ordner=ordner))
     log("HEAD", f"{'='*55}")
 
-    stats    = {"gefunden": 0, "remuxed": 0, "uebersprungen": 0, "fehler": 0}
     undo_log = []
 
     fort_q.put(0)
@@ -608,7 +674,6 @@ def verarbeite_einzelordner(
         log("SKIP", t("worker.einzel.no_mkv"))
         fort_q.put(100)
         task_q.put({"film": ordner.name, "schritt": t("worker.einzel.step_no_mkv"), "sub_prog": 100})
-        done_q.put((stats, None))
         return
 
     # HDR-Typ ermitteln
@@ -628,7 +693,6 @@ def verarbeite_einzelordner(
         log("SKIP", t("worker.einzel.no_dv"))
         fort_q.put(100)
         task_q.put({"film": ordner.name, "schritt": t("worker.einzel.step_no_dv"), "sub_prog": 100})
-        done_q.put((stats, None))
         return
 
     stats["gefunden"] += 1
@@ -697,7 +761,6 @@ def verarbeite_einzelordner(
                     stats["uebersprungen"] += 1
                     fort_q.put(100)
                     task_q.put({"schritt": t("worker.step_skipped_space"), "sub_prog": 100})
-                    done_q.put((stats, schreibe_log_datei(log_zeilen, simulation)))
                     return
                 arbeits_mkv = lokale_kopie_pfad / mkv_pfad.name
                 arbeits_mp4 = lokale_kopie_pfad / mp4_pfad.name
@@ -708,7 +771,6 @@ def verarbeite_einzelordner(
                     stats["fehler"] += 1
                     fort_q.put(100)
                     task_q.put({"schritt": t("worker.step_move_failed"), "sub_prog": 0})
-                    done_q.put((stats, schreibe_log_datei(log_zeilen, simulation)))
                     return
                 mkv_verschoben = True
 
@@ -719,7 +781,7 @@ def verarbeite_einzelordner(
                     ffmpeg, DOVI_TOOL, ffprobe,
                     arbeits_mkv, arbeits_mp4,
                     log_q, task_q, simulation, log_zeilen,
-                    stopp_event=stopp_event)
+                    stopp_event=stopp_event, dts_zu_eac3=dts_zu_eac3)
             else:
                 remux_ok = remux_zu_mp4(
                     ffmpeg, arbeits_mkv, arbeits_mp4,
@@ -751,7 +813,6 @@ def verarbeite_einzelordner(
                     mp4_pfad.unlink()
                 task_q.put({"schritt": t("worker.step_remux_failed"), "sub_prog": 0})
                 fort_q.put(100)
-                done_q.put((stats, schreibe_log_datei(log_zeilen, simulation)))
                 return
 
         fort_q.put(60)
@@ -765,7 +826,7 @@ def verarbeite_einzelordner(
                 erstellte_srts = extrahiere_untertitel(
                     ffmpeg, arbeits_mkv, srt_streams, log_q, task_q, simulation, log_zeilen,
                     undo_log=undo_log if not simulation else None,
-                    ziel_ordner=ordner)
+                    ziel_ordner=ordner, stopp_event=stopp_event)
             elif untertitel:
                 log("INFO", t("worker.no_foreign_subs"))
                 task_q.put({"schritt": t("worker.step_no_subs"), "sub_prog": 100})
@@ -780,7 +841,9 @@ def verarbeite_einzelordner(
             verschiebe_oder_loesche_mkv(
                 mkv_pfad, original_behalten, simulation, log, undo_log=undo_log,
                 old_mkv_global_pfad=old_mkv_global_pfad,
-                aktueller_pfad=arbeits_mkv if lokal_aktiv else None)
+                aktueller_pfad=arbeits_mkv if lokal_aktiv else None,
+                log_q=log_q, task_q=task_q, log_zeilen=log_zeilen,
+                stopp_event=stopp_event)
             if lokal_aktiv and not simulation:
                 mkv_verschoben = arbeits_mkv.exists()
 
@@ -811,22 +874,3 @@ def verarbeite_einzelordner(
 
     if stopp_event and stopp_event.is_set() and not simulation:
         rollback_session(undo_log, log, task_q)
-
-    fort_q.put(100)
-    task_q.put({"film": t("worker.done"), "schritt": "", "sub_prog": 100})
-
-    log("HEAD", f"\n{'='*55}")
-    log("HEAD",   t("worker.summary_title", suffix="  [EINZELORDNER]"))
-    log("HEAD", f"{'='*55}")
-    log("OK",   t("worker.summary_found", anzahl=stats['gefunden']))
-    log("OK",   t("worker.summary_remuxed", anzahl=stats['remuxed']))
-    log("SKIP", t("worker.summary_skipped", anzahl=stats['uebersprungen']))
-    log("ERR",  t("worker.summary_errors", anzahl=stats['fehler']))
-    log("HEAD", f"{'='*55}")
-    if simulation:
-        log("SIM", t("worker.summary_sim_note"))
-
-    log_pfad = schreibe_log_datei(log_zeilen, simulation)
-    log("HEAD", t("worker.summary_log_saved", name=log_pfad.name))
-    log("HEAD", t("worker.summary_log_location", pfad=log_pfad.parent))
-    done_q.put((stats, log_pfad))

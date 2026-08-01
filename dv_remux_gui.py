@@ -1,8 +1,38 @@
 """
-dv_remux_gui.py  v5.9.0
+dv_remux_gui.py  v5.9.1
 =======================
 GUI tool: Dolby Vision MKV → MP4 remux + SRT subtitle extraction
 For Jellyfin / LG TV
+
+New in v5.9.1 (bug fix release, no new features):
+  • Fixed three ways files could be destroyed:
+    - A copy/move whose source and target resolved to the same path
+      truncated the file to zero bytes and then deleted it (possible when
+      the local working folder was set to the source folder).
+    - The Dolby Vision box injection assumed moov was the last top-level
+      box but never checked; on a file that was already faststarted it
+      overwrote mdat and truncated the video away – while returning success.
+    - The faststart step deleted the original before renaming the temporary
+      file; a failed rename (common on Windows when a virus scanner or the
+      Explorer briefly holds the new file) then removed the only remaining
+      copy. Now an atomic os.replace().
+  • The three remux workers are wrapped in try/except/finally, so the GUI
+    always receives its completion signal. Previously an unexpected
+    exception killed the thread silently and Start stayed disabled forever.
+    The summary and the log file are now written after the workers' own
+    cleanup, so the "original restored" messages reach the log file too.
+  • Closing the window during a run no longer kills the worker instantly;
+    it waits for the rollback and for the original MKV to be moved back.
+  • The converter no longer sends two completion signals / writes its log
+    file twice.
+  • Simulation mode no longer creates directories, and it now verifies that
+    ffprobe exists – without it every movie was silently reported as
+    "not Dolby Vision".
+  • P5→P8 now converts DTS to E-AC3 as well, warns about anamorphic
+    material it cannot correct, and cleans up a half-written MP4 on failure.
+  • dovi_tool is now found on Linux/macOS too (no hardcoded .exe).
+  • The config file is written atomically and a damaged one is kept as .bak
+    instead of being silently discarded.
 
 New in v5.9.0:
   • Fixed: duplicate Dolby Vision configuration box. Current ffmpeg versions
@@ -70,7 +100,7 @@ New in v5.8.0:
     by a startup check). Written .log files follow the language active at
     the time each line was produced. The language selection is stored in
     the config (key "sprache"). New central helper t(key, **kwargs) with a
-    fallback chain (current language → German → the key itself) and robust
+    fallback chain (current language → default language → the key itself) and robust
     behaviour on missing format placeholders (no crash, unformatted text as
     fallback).
   • Code split into the package dv_remux/ (konstanten, config, sprache,
@@ -170,10 +200,12 @@ Requirements:
     In simulation mode ffmpeg/ffprobe are NOT required.
 """
 
+from dv_remux.konstanten import stelle_ordner_sicher
 from dv_remux.sprache import sprachen_konsistenz_pruefen
 from dv_remux.gui import App
 
 if __name__ == "__main__":
+    stelle_ordner_sicher()
     sprachen_konsistenz_pruefen()
     app = App()
     app.mainloop()
