@@ -6,15 +6,15 @@ from pathlib import Path
 # Dieses Modul liegt in dv_remux/ – der Projekt-Root ist eine Ebene höher.
 PROJEKT_ROOT = Path(__file__).resolve().parent.parent
 
-VERSION      = "5.9.1"
+VERSION      = "5.9.2"
 CONFIG_ORDNER = PROJEKT_ROOT / "config"
 CONFIG_DATEI  = CONFIG_ORDNER / "dv_remux_config.json"
 LOG_ORDNER    = PROJEKT_ROOT / "logs"
 LANG_ORDNER   = PROJEKT_ROOT / "lang"
 TEXT_CODECS   = {"subrip", "ass", "ssa", "webvtt", "mov_text", "text", "srt"}
-# Auf Windows heißt das Tool dovi_tool.exe, sonst dovi_tool. Ohne diese
-# Unterscheidung wäre DOVI_TOOL.exists() außerhalb von Windows immer False und
-# die P5→P8-Konvertierung würde stumm ausfallen.
+# Seit v5.9.2 vom Remux-Pfad nicht mehr benutzt (Profil 5 wird nativ belassen,
+# siehe konvertiere_dv_p5_zu_p8). Bleibt für die Statusanzeige in der GUI.
+# Auf Windows heißt das Tool dovi_tool.exe, sonst dovi_tool.
 DOVI_TOOL     = PROJEKT_ROOT / "tools" / (
     "dovi_tool.exe" if sys.platform == "win32" else "dovi_tool")
 LOKALE_KOPIE_PUFFER = 2.3   # Sicherheitsfaktor für Platzbedarf bei lokaler Arbeitskopie

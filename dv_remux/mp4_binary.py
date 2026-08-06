@@ -370,12 +370,18 @@ def _dvcc_vorhanden(mp4_pfad: Path) -> bool:
 
 
 def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,
-                          log_zeilen: list, simulation: bool) -> None:
+                          log_zeilen: list, simulation: bool,
+                          dv_profil: int = 8, compat_id: int = 1) -> None:
     """
     Nach normalem DV-Remux (ohne faststart): DV-Konfigurationsbox (dvvC/dvcC)
     prüfen/injizieren, dann moov nach vorne schieben (faststart) und ftyp auf
     mp42 setzen. Reihenfolge ist zwingend: die Injektion verlangt moov am
     Dateiende, faststart schiebt es nach vorne.
+
+    dv_profil/compat_id greifen nur, falls ffmpeg keine Box geschrieben hat und
+    injiziert werden muss. Für Profil-5-Quellen gehören dort 5 und 0 hin: deren
+    Basislayer ist IPT-PQ-C2 und damit gerade NICHT HDR10-kompatibel, ein
+    compat_id 1 wäre eine Falschaussage gegenüber dem Player.
     """
     if simulation:
         return
@@ -392,7 +398,8 @@ def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,
         log_zeilen.append(_bereinige_log(text))
     else:
         hat_dvcc = _dvcc_vorhanden(mp4_pfad)
-        _dvcc_schritt(mp4_pfad, hat_dvcc, log_q, log_zeilen)
+        _dvcc_schritt(mp4_pfad, hat_dvcc, log_q, log_zeilen,
+                      dv_profil=dv_profil, compat_id=compat_id)
 
     text = t("postproc.faststart_running")
     log_q.put(("INFO", text))
@@ -408,7 +415,8 @@ def nachbearbeite_dv_mp4(mp4_pfad: Path, log_q: queue.Queue,
 
 
 def _dvcc_schritt(mp4_pfad: Path, hat_dvcc: bool, log_q: queue.Queue,
-                  log_zeilen: list) -> None:
+                  log_zeilen: list, dv_profil: int = 8,
+                  compat_id: int = 1) -> None:
     """
     HEVC-DV-Konfigurationsbox prüfen/injizieren (aus nachbearbeite_dv_mp4
     ausgelagert). Geschrieben wird je nach Sample-Entry dvvC oder dvcC –
@@ -418,7 +426,8 @@ def _dvcc_schritt(mp4_pfad: Path, hat_dvcc: bool, log_q: queue.Queue,
         text = t("postproc.dvcc_missing")
         log_q.put(("INFO", text))
         log_zeilen.append(_bereinige_log(text))
-        if injiziere_dvcc_box(mp4_pfad):
+        if injiziere_dvcc_box(mp4_pfad, dv_profil=dv_profil,
+                              compat_id=compat_id):
             text = t("postproc.dvcc_ok")
             log_q.put(("OK", text))
             log_zeilen.append(_bereinige_log(text))

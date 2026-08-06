@@ -112,6 +112,18 @@ def ermittle_audio_streams(ffprobe: Path, mkv_pfad: Path) -> list:
     except Exception:
         return []
 
+def _ist_forced(stream: dict) -> bool:
+    """
+    Forced-Spur erkennen. Primär über das Disposition-Flag, ersatzweise über
+    den Titel – manche Releases setzen das Flag nicht und schreiben die
+    Kennzeichnung nur in den Namen ("German Forced", "Erzwungen").
+    """
+    if stream.get("disposition", {}).get("forced"):
+        return True
+    titel = (stream.get("tags", {}).get("title") or "").lower()
+    return any(wort in titel for wort in ("forced", "erzwungen"))
+
+
 def ermittle_untertitel_streams(ffprobe: Path, mkv_pfad: Path) -> list:
     """Alle Untertitel-Streams analysieren (braucht ffprobe)."""
     befehl = [
@@ -129,6 +141,11 @@ def ermittle_untertitel_streams(ffprobe: Path, mkv_pfad: Path) -> list:
                 "codec":    s.get("codec_name", "unbekannt"),
                 "language": s.get("tags", {}).get("language", "und"),
                 "title":    s.get("tags", {}).get("title", ""),
+                # Forced-Spuren zählen NICHT als Duplikat der Vollspur derselben
+                # Sprache – sonst gewinnt die zuerst gelistete. Bei SNW S04E02
+                # stand "German Forced" (472 Byte) vor "German" (48 KB) und
+                # verdrängte die vollständige Spur komplett.
+                "forced":   _ist_forced(s),
             }
             for s in daten.get("streams", [])
         ]
@@ -150,6 +167,9 @@ def simuliere_streams_aus_nfo(nfo_pfad: Path) -> list:
                 "codec":    "subrip",
                 "language": lang,
                 "title":    "",
+                # Die NFO speichert kein Forced-Flag – in der Simulation gilt
+                # jede Spur als normal. Der Echtlauf liest es aus der MKV.
+                "forced":   False,
             })
         return spuren
     except Exception:

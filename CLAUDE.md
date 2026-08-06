@@ -13,7 +13,7 @@ python dv_remux_gui.py
 ## Zweck
 
 `dv_remux_gui.py` ist nur der Einstiegspunkt; die Logik liegt im Paket `dv_remux/`.
-Die Version steht an **einer** Stelle: `konstanten.py` → `VERSION` (aktuell **5.9.1**).
+Die Version steht an **einer** Stelle: `konstanten.py` → `VERSION` (aktuell **5.9.2**).
 
 Drei Betriebsmodi (Toggle-Buttons in der GUI, Config-Key `"modus"`):
 - **`"filme"`** – ein MKV pro Unterordner, steuert `verarbeite_sammlung()`
@@ -30,6 +30,24 @@ Drei Betriebsmodi (Toggle-Buttons in der GUI, Config-Key `"modus"`):
 - **Der Record ist 24 Byte lang** (Box also 32 Byte), inklusive der vier
   Reserved-Words. Eine kürzere Box ist defekt, auch wenn ffprobe die ersten
   Felder noch korrekt anzeigt.
+- **DV Profil 5 wird nicht konvertiert, sondern nativ durchgereicht** (seit
+  v5.9.2). Sein Basislayer liegt in IPT-PQ-C2 und ist damit kein gültiges HDR10.
+  `dovi_tool -m 3` schreibt nur die RPU um und fasst kein einziges Pixel an – die
+  so erzeugten Dateien meldeten `dv_profile=8, compat_id=1` auf IPT-Pixeln, eine
+  laut Spec ungültige Kombination, und weder LG-Player noch Jellyfin öffneten
+  sie. Messbar im SPS: `video_full_range_flag=1` und colour_primaries/transfer/
+  matrix je `2` (unspecified), wo eine gesunde Datei `0 / 9 / 16 / 9` zeigt.
+  Deshalb: `remux_zu_mp4(..., dv_profil=5)` setzt `-tag:v dvh1`,
+  `nachbearbeite_dv_mp4(..., dv_profil=5, compat_id=0)` schreibt den ehrlichen
+  Record. Am LG G4 verifiziert. `konvertiere_dv_p5_zu_p8()` steht als Gerüst mit
+  Warnung im Docstring noch in pipeline.py, wird aber nicht mehr aufgerufen –
+  ein echtes 8.1 bräuchte ein Re-Encode des Basislayers (libplacebo,
+  IPT-PQ-C2 → BT.2020/PQ).
+- **Forced- und Vollspur derselben Sprache sind keine Duplikate.** Der Zähler in
+  `extrahiere_untertitel()` läuft über `(sprache, forced)`; Forced-Spuren gehen
+  nach `.<lang>.forced.srt`. `aktualisiere_nfo()` schneidet die Marker aus
+  `SRT_MARKER` ab, bevor es den Sprachcode aus dem Dateinamen liest – sonst
+  landet `.ger.forced.srt` als `<language>und</language>` in der NFO.
 - **Anamorphe Quellen** (SAR ≠ 1:1) lehnt Jellyfin für Direct Play ab
   („anamorphic video is not supported"). `anamorph_argumente()` in pipeline.py
   korrigiert bis 1 % Abweichung mit **`-aspect W:H` allein** – die `pasp`-Box im
@@ -104,6 +122,7 @@ Der Worker `verarbeite_sammlung()` läuft in einem eigenen Thread und durchläuf
 1. `movie.nfo` einlesen → HDR-Typ prüfen (`hdrtype = "dolbyvision"`)
 2. `.mkv`-Datei im Ordner finden
 3. **Remux** via ffmpeg: `ffmpeg -i input.mkv -c copy -tag:v hvc1 -map 0:v -map 0:a -movflags +faststart output.mp4`
+   (bei DV-Profil-5-Quellen `-tag:v dvh1` statt `hvc1`, siehe oben)
 4. Optional: **Untertitel** als `.srt` extrahieren (nur Text-Codecs: subrip, ass, ssa, webvtt, mov_text, text, srt)
 5. Optional: **Untertitel einbetten** (`embed_subs`) – SRT-Streams als `-c:s mov_text` in die MP4 mappen
 6. Optional: **`movie.nfo` aktualisieren** – `original_filename` (.mkv → .mp4) und `<subtitle>`-Einträge in `<streamdetails>` neu schreiben; Backup als `movie.nfo.bak`

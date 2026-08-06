@@ -5,7 +5,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from dv_remux.konstanten import VERSION, DOVI_TOOL, TEXT_CODECS
+from dv_remux.konstanten import VERSION, TEXT_CODECS
 from dv_remux.sprache import t, _bereinige_log
 from dv_remux.mkv_analyse import (
     finde_mkv, lese_hdrtype_aus_nfo, ermittle_hdrtype_aus_mkv,
@@ -17,7 +17,7 @@ from dv_remux.dateioperationen import (
     verschiebe_oder_loesche_mkv,
 )
 from dv_remux.pipeline import (
-    konvertiere_dv_p5_zu_p8, remux_zu_mp4, extrahiere_untertitel,
+    remux_zu_mp4, extrahiere_untertitel,
     aktualisiere_nfo, rollback_session, schreibe_log_datei,
 )
 
@@ -188,18 +188,16 @@ def _verarbeite_serien_impl(
                 stats["gefunden"] += 1
                 log("INFO", t("worker.serien.dv_found", name=mkv_pfad.name))
 
-                # DV-Profil-Prüfung: Profil 5 (ICtCp) → P5→P8-Konvertierung oder Warnung
-                braucht_p5_fix = False
+                # DV-Profil-Prüfung: Profil 5 (ICtCp) wird bewusst NICHT
+                # konvertiert, sondern nativ als Profil 5 durchgereicht.
+                ist_p5 = False
                 dv_profil, farb_matrix = ermittle_dv_profil(ffprobe, mkv_pfad)
                 _ictcp = farb_matrix and any(kw in str(farb_matrix).lower()
                                     for kw in ("ictcp", "ipt-pq", "ipt_pq"))
                 if dv_profil == 5 or _ictcp:
-                    braucht_p5_fix = True
-                    if DOVI_TOOL.exists():
-                        log("WARN", "  " + t("worker.p5_detected_converting", profil=dv_profil or "?"))
-                    else:
-                        log("WARN", "  " + t("worker.p5_detected_no_tool", profil=dv_profil or "?"))
-                        log("WARN", "      " + t("worker.p5_tool_hint"))
+                    ist_p5 = True
+                    log("WARN", "  " + t("worker.p5_detected_nativ", profil=dv_profil or "?"))
+                    log("INFO", "      " + t("worker.p5_nativ_hinweis"))
 
                 # Untertitel-Streams ermitteln (vor Remux)
                 streams = []
@@ -261,22 +259,18 @@ def _verarbeite_serien_impl(
                             mkv_verschoben = True
 
                         task_q.put({"schritt": t("worker.step_remux_running"), "sub_prog": None})
-                        if braucht_p5_fix and DOVI_TOOL.exists():
-                            task_q.put({"schritt": t("worker.step_p5p8_running"), "sub_prog": None})
-                            remux_ok = konvertiere_dv_p5_zu_p8(
-                                ffmpeg, DOVI_TOOL, ffprobe,
-                                arbeits_mkv, arbeits_mp4,
-                                log_q, task_q, simulation, log_zeilen,
-                                stopp_event=stopp_event, dts_zu_eac3=dts_zu_eac3)
-                        else:
-                            remux_ok = remux_zu_mp4(
-                                ffmpeg, arbeits_mkv, arbeits_mp4,
-                                log_q, task_q, simulation, log_zeilen,
-                                stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                                ffprobe_pfad=ffprobe, kein_faststart=True,
-                                dts_zu_eac3=dts_zu_eac3)
-                            if remux_ok:
-                                nachbearbeite_dv_mp4(arbeits_mp4, log_q, log_zeilen, simulation)
+                        remux_ok = remux_zu_mp4(
+                            ffmpeg, arbeits_mkv, arbeits_mp4,
+                            log_q, task_q, simulation, log_zeilen,
+                            stopp_event=stopp_event, text_sub_indices=text_sub_indices,
+                            ffprobe_pfad=ffprobe, kein_faststart=True,
+                            dts_zu_eac3=dts_zu_eac3,
+                            dv_profil=5 if ist_p5 else None)
+                        if remux_ok:
+                            nachbearbeite_dv_mp4(
+                                arbeits_mp4, log_q, log_zeilen, simulation,
+                                dv_profil=5 if ist_p5 else 8,
+                                compat_id=0 if ist_p5 else 1)
 
                         erfolg = remux_ok
                         if remux_ok and lokal_aktiv:
@@ -444,18 +438,16 @@ def _verarbeite_sammlung_impl(
         nfo_pfad = ordner / "movie.nfo"
         mp4_pfad = mkv_pfad.with_suffix(".mp4")
 
-        # DV-Profil-Prüfung: Profil 5 (ICtCp) → P5→P8-Konvertierung oder Warnung
-        braucht_p5_fix = False
+        # DV-Profil-Prüfung: Profil 5 (ICtCp) wird bewusst NICHT konvertiert,
+        # sondern nativ als Profil 5 durchgereicht.
+        ist_p5 = False
         dv_profil, farb_matrix = ermittle_dv_profil(ffprobe, mkv_pfad)
         _ictcp = farb_matrix and any(kw in str(farb_matrix).lower()
                                     for kw in ("ictcp", "ipt-pq", "ipt_pq"))
         if dv_profil == 5 or _ictcp:
-            braucht_p5_fix = True
-            if DOVI_TOOL.exists():
-                log("WARN", t("worker.p5_detected_converting", profil=dv_profil or "?"))
-            else:
-                log("WARN", t("worker.p5_detected_no_tool", profil=dv_profil or "?"))
-                log("WARN", t("worker.p5_tool_hint"))
+            ist_p5 = True
+            log("WARN", t("worker.p5_detected_nativ", profil=dv_profil or "?"))
+            log("INFO", t("worker.p5_nativ_hinweis"))
 
         # 3. Untertitel-Streams ermitteln (vor Remux, für Einbettung + SRT)
         streams = []
@@ -516,25 +508,22 @@ def _verarbeite_sammlung_impl(
                         continue
                     mkv_verschoben = True
 
-                # 6. Remux (normaler Pfad) oder P5→P8-Konvertierung
+                # 6. Remux – Profil 5 läuft durch denselben Pfad, nur mit
+                #    abweichender DV-Signalisierung (dvh1/dvcC, compat_id 0)
                 task_q.put({"schritt": t("worker.step_remux_running"), "sub_prog": None})
-                if braucht_p5_fix and DOVI_TOOL.exists():
-                    task_q.put({"schritt": t("worker.step_p5p8_running"), "sub_prog": None})
-                    remux_ok = konvertiere_dv_p5_zu_p8(
-                        ffmpeg, DOVI_TOOL, ffprobe,
-                        arbeits_mkv, arbeits_mp4,
-                        log_q, task_q, simulation, log_zeilen,
-                        stopp_event=stopp_event, dts_zu_eac3=dts_zu_eac3)
-                else:
-                    remux_ok = remux_zu_mp4(
-                        ffmpeg, arbeits_mkv, arbeits_mp4,
-                        log_q, task_q, simulation, log_zeilen,
-                        stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                        ffprobe_pfad=ffprobe, kein_faststart=True,
-                        dts_zu_eac3=dts_zu_eac3
-                    )
-                    if remux_ok:
-                        nachbearbeite_dv_mp4(arbeits_mp4, log_q, log_zeilen, simulation)
+                remux_ok = remux_zu_mp4(
+                    ffmpeg, arbeits_mkv, arbeits_mp4,
+                    log_q, task_q, simulation, log_zeilen,
+                    stopp_event=stopp_event, text_sub_indices=text_sub_indices,
+                    ffprobe_pfad=ffprobe, kein_faststart=True,
+                    dts_zu_eac3=dts_zu_eac3,
+                    dv_profil=5 if ist_p5 else None
+                )
+                if remux_ok:
+                    nachbearbeite_dv_mp4(
+                        arbeits_mp4, log_q, log_zeilen, simulation,
+                        dv_profil=5 if ist_p5 else 8,
+                        compat_id=0 if ist_p5 else 1)
 
                 erfolg = remux_ok
                 if remux_ok and lokal_aktiv:
@@ -698,18 +687,16 @@ def _verarbeite_einzelordner_impl(
     stats["gefunden"] += 1
     mp4_pfad = mkv_pfad.with_suffix(".mp4")
 
-    # DV-Profil-Prüfung: Profil 5 (ICtCp) → P5→P8-Konvertierung oder Warnung
-    braucht_p5_fix = False
+    # DV-Profil-Prüfung: Profil 5 (ICtCp) wird bewusst NICHT konvertiert,
+    # sondern nativ als Profil 5 durchgereicht.
+    ist_p5 = False
     dv_profil, farb_matrix = ermittle_dv_profil(ffprobe, mkv_pfad)
     _ictcp = farb_matrix and any(kw in str(farb_matrix).lower()
                                     for kw in ("ictcp", "ipt-pq", "ipt_pq"))
     if dv_profil == 5 or _ictcp:
-        braucht_p5_fix = True
-        if DOVI_TOOL.exists():
-            log("WARN", t("worker.p5_detected_converting", profil=dv_profil or "?"))
-        else:
-            log("WARN", t("worker.p5_detected_no_tool", profil=dv_profil or "?"))
-            log("WARN", t("worker.p5_tool_hint"))
+        ist_p5 = True
+        log("WARN", t("worker.p5_detected_nativ", profil=dv_profil or "?"))
+        log("INFO", t("worker.p5_nativ_hinweis"))
 
     # Untertitel-Streams ermitteln
     streams = []
@@ -775,22 +762,18 @@ def _verarbeite_einzelordner_impl(
                 mkv_verschoben = True
 
             task_q.put({"schritt": t("worker.step_remux_running"), "sub_prog": None})
-            if braucht_p5_fix and DOVI_TOOL.exists():
-                task_q.put({"schritt": t("worker.step_p5p8_running"), "sub_prog": None})
-                remux_ok = konvertiere_dv_p5_zu_p8(
-                    ffmpeg, DOVI_TOOL, ffprobe,
-                    arbeits_mkv, arbeits_mp4,
-                    log_q, task_q, simulation, log_zeilen,
-                    stopp_event=stopp_event, dts_zu_eac3=dts_zu_eac3)
-            else:
-                remux_ok = remux_zu_mp4(
-                    ffmpeg, arbeits_mkv, arbeits_mp4,
-                    log_q, task_q, simulation, log_zeilen,
-                    stopp_event=stopp_event, text_sub_indices=text_sub_indices,
-                    ffprobe_pfad=ffprobe, kein_faststart=True,
-                    dts_zu_eac3=dts_zu_eac3)
-                if remux_ok:
-                    nachbearbeite_dv_mp4(arbeits_mp4, log_q, log_zeilen, simulation)
+            remux_ok = remux_zu_mp4(
+                ffmpeg, arbeits_mkv, arbeits_mp4,
+                log_q, task_q, simulation, log_zeilen,
+                stopp_event=stopp_event, text_sub_indices=text_sub_indices,
+                ffprobe_pfad=ffprobe, kein_faststart=True,
+                dts_zu_eac3=dts_zu_eac3,
+                dv_profil=5 if ist_p5 else None)
+            if remux_ok:
+                nachbearbeite_dv_mp4(
+                    arbeits_mp4, log_q, log_zeilen, simulation,
+                    dv_profil=5 if ist_p5 else 8,
+                    compat_id=0 if ist_p5 else 1)
 
             erfolg = remux_ok
             if remux_ok and lokal_aktiv:

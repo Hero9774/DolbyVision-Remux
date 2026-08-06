@@ -41,7 +41,7 @@ GUI tool for **batch-remuxing Dolby Vision MKV files to MP4** — without re-enc
 - **Anamorphic correction** — sources with SAR ≠ 1:1 (which Jellyfin refuses to play directly) are corrected in the container without touching the bitstream, as long as the deviation stays below 1 %
 - **DTS → E-AC3** — DTS cannot be stored in MP4 in a way hardware players accept; the affected tracks are converted to E-AC3 640k while everything else is copied unchanged
 - **faststart + mp42** — moves the `moov` atom before `mdat` and sets `major_brand` to `mp42` for optimal player compatibility
-- **DV Profile 5 → Profile 8.1 conversion** (blue-tint fix) via `dovi_tool -m 3 convert` — 5-step pipeline without re-encoding
+- **DV Profile 5 stays Profile 5** — signalled honestly as `dvh1` / `dvcC` with `compat_id=0` instead of being mislabelled as 8.1 (see [DV Profile 5](#dv-profile-5-is-kept-as-profile-5-since-v592))
 - **Three modes:**
   - **Movies** — processes all subfolders of a root directory (one MKV per folder)
   - **Series** — recursive processing of season/episode structures
@@ -66,7 +66,7 @@ GUI tool for **batch-remuxing Dolby Vision MKV files to MP4** — without re-enc
 | Python | 3.8+ | `tkinter` is included |
 | ffmpeg | current | only needed for real runs |
 | ffprobe | current | only needed for real runs |
-| dovi_tool | current | **optional** — only for DV Profile 5 conversion |
+| dovi_tool | — | **no longer used** since v5.9.2; the GUI still shows its status |
 
 In **simulation mode**, neither ffmpeg nor ffprobe is required — ideal for testing the pipeline.
 
@@ -151,7 +151,7 @@ The **backup folder** for the original MKV is selectable: "In movie folder" (an 
 
 When your movies live on a NAS, working directly on it is slow and generates a lot of network traffic (faststart in particular rewrites the whole 20–30 GB file NAS-internally).
 
-With **"Process locally (offload NAS)"** enabled, the original MKV is **moved** to a local working folder (default: the Windows temp folder), the complete remux/P5→P8/dvcC/faststart pipeline runs there, and only the finished MP4 is transferred back to the NAS target folder. This is significantly faster and offloads the network.
+With **"Process locally (offload NAS)"** enabled, the original MKV is **moved** to a local working folder (default: the Windows temp folder), the complete remux/dvcC/faststart pipeline runs there, and only the finished MP4 is transferred back to the NAS target folder. This is significantly faster and offloads the network.
 
 Safety guarantees:
 
@@ -390,21 +390,24 @@ Detection is two-stage:
 
 If no NFO exists or no DV is detected, the movie is marked as `[SKIP]` in the log.
 
-### DV Profile 5 conversion (blue-tint fix)
+### DV Profile 5 is kept as Profile 5 (since v5.9.2)
 
-**Dolby Vision Profile 5** (typical for WEB-DL releases, recognizable by `dvhe.05` / `IPT-PQ-C2` in MediaInfo) uses the **ICtCp color space** instead of standard YUV. Devices without a native DV decoder interpret this data as YUV — the result is a strong **color/blue tint**.
+**Dolby Vision Profile 5** (typical for WEB-DL releases, recognizable by `dvhe.05` / `IPT-PQ-C2` in MediaInfo) carries its base layer in the **IPT-PQ-C2 color space** instead of standard YUV. Devices without a native DV decoder interpret this data as YUV — the result is a strong **color/blue tint**.
 
-If `dovi_tool.exe` is present in `tools/`, a **5-step pipeline** runs fully automatically:
+Up to v5.9.1 the tool tried to convert such sources to Profile 8.1 with `dovi_tool -m 3`. **That never worked and the code path is gone.** `dovi_tool` rewrites the RPU, it does not touch a single pixel — so the base layer stayed IPT while the DV configuration record claimed a HDR10-compatible one. Measured on two real episodes, the resulting files carried `video_full_range_flag=1` and colour_primaries / transfer / matrix all set to `2` (unspecified), where a healthy file shows `0 / 9 / 16 / 9`. Both the LG media player and the Jellyfin clients refused them outright ("file cannot be recognized").
 
-| Step | Action |
-|---|---|
-| **[1/5] Extract HEVC** | `ffmpeg -c:v copy -an -sn` → `%TEMP%\_dv_remux_*.hevc` |
-| **[2/5] RPU P5 → P8.1** | `dovi_tool -m 3 convert` — mode 3 is explicitly for Profile 5 → 8.1 |
-| **[3/5] Assemble MP4** | P8 HEVC + audio from the original MKV, `-tag:v dvh1`, no faststart |
-| **[4/5] DV config box** | Dolby Vision Configuration Record (Profile 8.1, level auto, compat_id=1) — skipped when ffmpeg already wrote one |
-| **[5/5] faststart + mp42** | `moov` before `mdat`, `major_brand = mp42` |
+Profile 5 sources are therefore remuxed **unchanged**, with honest signalling:
 
-The DV level in the configuration box is calculated automatically from resolution and frame rate. Temp files in `%TEMP%` are cleaned up in every case. If `dovi_tool.exe` is missing, the normal remux runs through — with a warning in the log.
+| Aspect | Profile 7 / 8 source | Profile 5 source |
+|---|---|---|
+| Sample entry | `hvc1` | `dvh1` |
+| DV box | `dvvC` | `dvcC` |
+| `dv_profile` | 8 | 5 |
+| `bl_signal_compatibility_id` | 1 | **0** |
+
+This is lossless and takes no longer than a normal remux. Verified on an LG G4: such files play back natively, including Dolby Vision.
+
+**The trade-off:** a Profile 5 file has no HDR10 fallback by definition, so clients without a DV decoder (browsers, the Jellyfin web player) still transcode and still show the color cast. A genuine Profile 8.1 would require **re-encoding the base layer** (IPT-PQ-C2 → BT.2020/PQ, e.g. via `libplacebo`) — lossy and orders of magnitude slower. `konvertiere_dv_p5_zu_p8()` remains in `pipeline.py` as scaffolding for anyone who wants to build that, carrying a warning in its docstring; nothing calls it.
 
 **Profile 5 detection** (three-stage, without NFO):
 1. `dv_profile` directly from `ffprobe` stream side-data
@@ -433,6 +436,30 @@ When errors occur, it is always worth checking the log under `logs/`.
 ---
 
 ## Changelog
+
+### v5.9.2
+
+**Removed: the P5 → P8.1 conversion, because it could not work**
+
+`dovi_tool` only rewrites the RPU — the base layer stays in IPT-PQ-C2. The files it produced declared `dv_profile=8, compat_id=1` on top of IPT pixels, an invalid combination, and neither the LG media player nor Jellyfin would open them. Three separate defects came together:
+
+- The MP4 was assembled with `-tag:v dvh1`, so step 4 wrote `dvcC` — but the record inside announced Profile 8.1, which belongs in an `hvc1` entry with `dvvC`.
+- The input was a raw HEVC elementary stream, so ffmpeg wrote **no `colr` box** at all. Jellyfin had to inject the color space via `setparams` and tone-mapped at 0.17× — no direct play.
+- The base layer was never converted. A real Profile 8.1 needs a re-encode (IPT-PQ-C2 → BT.2020/PQ), which this pipeline never did.
+
+Profile 5 sources now go through the ordinary remux path with `dv_profil=5`: sample entry `dvh1`, `dvcC` with `compat_id=0`, no `dovi_tool`, no re-encode. Verified on an LG G4.
+
+**Fixed: forced subtitles displaced the full track**
+
+The duplicate check in `extrahiere_untertitel()` counted per language instead of per language *and* forced flag, so whichever track came first won. On a source listing "German Forced" (472 bytes) before "German" (48 KB), the complete German track was dropped and the forced one ended up under the plain `.ger.srt` name.
+
+- `ermittle_untertitel_streams()` now reports `forced`, read from `disposition.forced` with a title fallback for releases that omit the flag.
+- Forced tracks are written as `.<lang>.forced.srt`, the name Jellyfin recognizes.
+- `aktualisiere_nfo()` strips trailing markers (`forced`, `sdh`, `cc`, `hi`) before reading the language code from the filename — otherwise `.ger.forced.srt` would have produced `<language>und</language>`.
+
+**Also fixed**
+
+- The embedded subtitle track announced in the log ("n English subtitle tracks will be embedded") was silently dropped on Profile-5 sources — the old step 3 only mapped video and audio.
 
 ### v5.9.1
 
@@ -525,7 +552,7 @@ Bug-fix release — no new features apart from the converter's info button. Full
 
 | Component | Author | License | Use |
 |---|---|---|---|
-| [dovi_tool](https://github.com/quietvoid/dovi_tool) | quietvoid | GPL v3.0 or later | DV Profile 5 → Profile 8 conversion |
+| [dovi_tool](https://github.com/quietvoid/dovi_tool) | quietvoid | GPL v3.0 or later | formerly DV Profile 5 → Profile 8; unused since v5.9.2 |
 
 dovi_tool is **not included in the repository**. Download: <https://github.com/quietvoid/dovi_tool/releases>
 

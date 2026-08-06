@@ -18,6 +18,10 @@ from dv_remux.mkv_analyse import (ermittle_audio_streams, ermittle_video_codec,
 from dv_remux.mp4_binary import (_berechne_dv_level, _dvcc_vorhanden,
                                  injiziere_dvcc_box, mache_faststart_und_ftyp)
 
+# Namensbestandteile, die HINTER dem Sprachcode einer SRT stehen können.
+# Werden beim Auslesen der Sprache für die NFO abgeschnitten.
+SRT_MARKER = {"forced", "erzwungen", "sdh", "cc", "hi"}
+
 
 def konvertiere_dv_p5_zu_p8(
         ffmpeg: Path, dovi_tool: Path, ffprobe: Path,
@@ -26,7 +30,22 @@ def konvertiere_dv_p5_zu_p8(
         simulation: bool, log_zeilen: list,
         stopp_event=None, dts_zu_eac3: bool = False) -> bool:
     """
-    DV Profil 5 (ICtCp) → Profil 8.1 (HDR10-kompatibel) ohne Re-Encoding:
+    !!! WIRD SEIT v5.9.2 NICHT MEHR AUFGERUFEN – NICHT REAKTIVIEREN !!!
+
+    Die Funktion erzeugt KEIN gültiges Profil 8.1. dovi_tool schreibt nur die
+    RPU um; die Bilddaten des Basislayers bleiben in IPT-PQ-C2. Das Ergebnis
+    behauptet im dvcC-Record einen HDR10-kompatiblen Basislayer und liefert
+    IPT-Pixel – gemessen an SNW S04E02/E03: video_full_range_flag=1 und
+    colour_primaries/transfer/matrix jeweils 2 (unspecified), während eine
+    gesunde Datei 0 / 9 / 16 / 9 zeigt. LG-Player und Jellyfin verweigern
+    solche Dateien.
+
+    Eine echte Konvertierung braucht zwischen Schritt 1 und 2 zusätzlich ein
+    Re-Encode des Basislayers (libplacebo: IPT-PQ-C2 → BT.2020/PQ) – also
+    verlustbehaftet und um Größenordnungen langsamer. Wer das will, baut es
+    hier ein; der bestehende Ablauf allein genügt nicht.
+
+    Ursprüngliche Beschreibung:
       Schritt 1: HEVC-Stream extrahieren (ffmpeg -c:v copy)
       Schritt 2: RPU konvertieren P5→P8.1 + CMv4.0-Metadaten
                  (dovi_tool --edit-config add_cmv4_default_metadata=true -m 3 convert)
@@ -371,13 +390,20 @@ def extrahiere_untertitel(ffmpeg: Path, mkv_pfad: Path, streams: list,
             break
         sprache = stream["language"]
         idx     = stream["index"]
-        sprachzaehler[sprache] = sprachzaehler.get(sprache, 0) + 1
-        if sprachzaehler[sprache] > 1:
+        # Forced- und Vollspur derselben Sprache werden getrennt gezählt: sie
+        # bekommen unterschiedliche Dateinamen und dürfen sich deshalb nicht
+        # gegenseitig als Duplikat verdrängen. '.forced.srt' ist die Endung,
+        # an der Jellyfin eine Forced-Spur erkennt.
+        forced  = bool(stream.get("forced"))
+        zaehler_key = (sprache, forced)
+        sprachzaehler[zaehler_key] = sprachzaehler.get(zaehler_key, 0) + 1
+        if sprachzaehler[zaehler_key] > 1:
             text = t("srt.duplicate_skip", sprache=sprache, idx=idx)
             log_q.put(("SKIP", text))
             log_zeilen.append(_bereinige_log(text))
             continue
-        srt_pfad = ziel_ordner / (basis.name + f".{sprache}.srt")
+        suffix = f".{sprache}.forced.srt" if forced else f".{sprache}.srt"
+        srt_pfad = ziel_ordner / (basis.name + suffix)
 
         task_q.put({
             "schritt":  f"SRT: {srt_pfad.name}",
@@ -448,8 +474,9 @@ def aktualisiere_nfo(
       3. <fileinfo><streamdetails>: alle <subtitle>-Einträge werden durch
          die tatsächlich vorhandenen SRT-Dateien ersetzt.
          Die Sprachcodes werden aus dem Dateinamen extrahiert:
-           Film.deu.srt      → <language>deu</language>
-           Film.deu.2.srt    → <language>deu</language>
+           Film.deu.srt        → <language>deu</language>
+           Film.deu.2.srt      → <language>deu</language>
+           Film.deu.forced.srt → <language>deu</language>
          Alle anderen Stream-Details (Video, Audio) bleiben unverändert.
 
     tinyMediaManager-Kommentar und XML-Deklaration bleiben erhalten,
@@ -532,6 +559,12 @@ def aktualisiere_nfo(
             # z.B. "War Machine 2026.deu.srt" → "deu"
             #      "War Machine 2026.deu.2.srt" → "deu"
             teile = srt_pfad.stem.split(".")   # stem = ohne .srt
+            # Nachgestellte Kennzeichnungen abschneiden, sonst wäre bei
+            # "Film.ger.forced.srt" der Sprachcode "forced" – der fällt durch
+            # die Längenprüfung und die Spur landete als <language>und</language>
+            # in der NFO.
+            while len(teile) >= 2 and teile[-1].lower() in SRT_MARKER:
+                teile.pop()
             sprache = "und"
             if len(teile) >= 2:
                 # letzter Teil könnte eine Zahl sein (deu.2) → dann vorletzter
@@ -712,7 +745,8 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
                  ffprobe_pfad: Path = None,
                  audio_indices: list = None,
                  kein_faststart: bool = False,
-                 dts_zu_eac3: bool = False) -> bool:
+                 dts_zu_eac3: bool = False,
+                 dv_profil: int = None) -> bool:
     """Remux MKV -> MP4 ohne Re-Encoding (Video immer -c copy).
     text_sub_indices: Stream-Indizes für Text-Untertitel → mov_text einbetten.
     audio_indices: Explizite Audio-Stream-Indizes (None = alle via -map 0:a).
@@ -720,6 +754,8 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
     kein_faststart: True = kein -movflags +faststart (für nachgelagerte dvcC-Injektion).
     dts_zu_eac3: DTS-Tonspuren nach E-AC3 wandeln (siehe dts_audio_argumente);
                  alle übrigen Spuren werden weiterhin nur kopiert.
+    dv_profil: Dolby-Vision-Profil der Quelle. Nur 5 wird gesondert behandelt
+               (Sample-Entry dvh1 statt hvc1) – siehe Kommentar bei video_tag.
     """
     if simulation:
         embed_info = t("remux.sim_embed_info", anzahl=len(text_sub_indices)) if text_sub_indices else ""
@@ -759,9 +795,21 @@ def remux_zu_mp4(ffmpeg: Path, mkv_pfad: Path, mp4_pfad: Path,
     geometrie   = ermittle_video_geometrie(ffprobe_pfad, mkv_pfad) if ffprobe_pfad else {}
     video_codec = geometrie.get("codec") or (
         ermittle_video_codec(ffprobe_pfad, mkv_pfad) if ffprobe_pfad else None)
+    # Profil 5 ist die Ausnahme: sein Basislayer liegt in IPT-PQ-C2, ist also
+    # KEIN gültiges HDR10. 'hvc1' + dvvC würde dem Player Cross-Kompatibilität
+    # versprechen, die die Datei nicht einlösen kann – LG-Player und Jellyfin
+    # verweigern sie dann (am G4 verifiziert). Korrekt ist hier 'dvh1' + dvcC
+    # mit compat_id 0. Wer echtes 8.1 will, kommt um ein Re-Encode des
+    # Basislayers (IPT → BT.2020/PQ) nicht herum; dovi_tool allein reicht
+    # nicht, es fasst ausschließlich die RPU an.
     if video_codec == "av1":
         video_tag = []
         text = t("remux.av1_detected")
+        log_q.put(("INFO", text))
+        log_zeilen.append(_bereinige_log(text))
+    elif dv_profil == 5:
+        video_tag = ["-tag:v", "dvh1"]
+        text = t("remux.p5_nativ")
         log_q.put(("INFO", text))
         log_zeilen.append(_bereinige_log(text))
     else:
